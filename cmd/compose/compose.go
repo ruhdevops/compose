@@ -35,7 +35,6 @@ import (
 	composepaths "github.com/compose-spec/compose-go/v2/paths"
 	"github.com/compose-spec/compose-go/v2/types"
 	composegoutils "github.com/compose-spec/compose-go/v2/utils"
-	"github.com/docker/buildx/util/logutil"
 	dockercli "github.com/docker/cli/cli"
 	"github.com/docker/cli/cli-plugins/metadata"
 	"github.com/docker/cli/cli/command"
@@ -423,16 +422,6 @@ func (o *BackendOptions) Add(option compose.Option) {
 
 // RootCommand returns the compose command with its child commands
 func RootCommand(dockerCli command.Cli, backendOptions *BackendOptions) *cobra.Command { //nolint:gocyclo
-	// filter out useless commandConn.CloseWrite warning message that can occur
-	// when using a remote context that is unreachable: "commandConn.CloseWrite: commandconn: failed to wait: signal: killed"
-	// https://github.com/docker/cli/blob/e1f24d3c93df6752d3c27c8d61d18260f141310c/cli/connhelper/commandconn/commandconn.go#L203-L215
-	logrus.AddHook(logutil.NewFilter([]logrus.Level{
-		logrus.WarnLevel,
-	},
-		"commandConn.CloseWrite:",
-		"commandConn.CloseRead:",
-	))
-
 	opts := ProjectOptions{}
 	var (
 		ansi     string
@@ -477,7 +466,7 @@ func RootCommand(dockerCli command.Cli, backendOptions *BackendOptions) *cobra.C
 				logrus.SetLevel(logrus.TraceLevel)
 			}
 
-			err := setEnvWithDotEnv(opts)
+			err := setEnvWithDotEnv(opts, dockerCli)
 			if err != nil {
 				return err
 			}
@@ -677,7 +666,21 @@ func stdinfo(dockerCli command.Cli) io.Writer {
 	return dockerCli.Err()
 }
 
-func setEnvWithDotEnv(opts ProjectOptions) error {
+func setEnvWithDotEnv(opts ProjectOptions, dockerCli command.Cli) error {
+	// Check if we're using a remote config (OCI or Git)
+	// If so, skip env loading as remote loaders haven't been initialized yet
+	// and trying to process the path would fail
+	remoteLoaders := opts.remoteLoaders(dockerCli)
+	for _, path := range opts.ConfigPaths {
+		for _, loader := range remoteLoaders {
+			if loader.Accept(path) {
+				// Remote config - skip env loading for now
+				// It will be loaded later when the project is fully initialized
+				return nil
+			}
+		}
+	}
+
 	options, err := cli.NewProjectOptions(opts.ConfigPaths,
 		cli.WithWorkingDirectory(opts.ProjectDir),
 		cli.WithOsEnv,

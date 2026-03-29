@@ -31,6 +31,7 @@ import (
 	"github.com/containerd/errdefs"
 	"github.com/docker/cli/cli"
 	"github.com/eiannone/keyboard"
+	"github.com/moby/moby/client"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 
@@ -245,22 +246,19 @@ func (s *composeService) Up(ctx context.Context, project *types.Project, options
 	}
 
 	monitor.withListener(func(event api.ContainerEvent) {
-		if event.Type != api.ContainerEventStarted {
-			return
-		}
-		if slices.Contains(attached, event.ID) && !event.Restarting {
+		if !shouldFollowStartEvent(event, attached, options.Start.AttachTo) {
 			return
 		}
 		eg.Go(func() error {
-			ctr, err := s.apiClient().ContainerInspect(globalCtx, event.ID)
+			res, err := s.apiClient().ContainerInspect(globalCtx, event.ID, client.ContainerInspectOptions{})
 			if err != nil {
 				appendErr(err)
 				return nil
 			}
 
-			err = s.doLogContainer(globalCtx, options.Start.Attach, event.Source, ctr, api.LogOptions{
+			err = s.doLogContainer(globalCtx, options.Start.Attach, event.Source, res.Container, api.LogOptions{
 				Follow: true,
-				Since:  ctr.State.StartedAt,
+				Since:  res.Container.State.StartedAt,
 			})
 			if errdefs.IsNotImplemented(err) {
 				// container may be configured with logging_driver: none
@@ -300,4 +298,17 @@ func (s *composeService) Up(ctx context.Context, project *types.Project, options
 		return cli.StatusError{StatusCode: exitCode, Status: errMsg}
 	}
 	return err
+}
+
+func shouldFollowStartEvent(event api.ContainerEvent, attached []string, attachTo []string) bool {
+	if event.Type != api.ContainerEventStarted {
+		return false
+	}
+	if len(attachTo) > 0 && !slices.Contains(attachTo, event.Service) {
+		return false
+	}
+	if slices.Contains(attached, event.ID) && !event.Restarting {
+		return false
+	}
+	return true
 }

@@ -39,11 +39,11 @@ import (
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/cli/cli/command/image/build"
 	"github.com/docker/cli/cli/streams"
-	"github.com/docker/docker/api/types/versions"
 	"github.com/google/uuid"
 	"github.com/moby/buildkit/client"
 	gitutil "github.com/moby/buildkit/frontend/dockerfile/dfgitutil"
 	"github.com/moby/buildkit/util/progress/progressui"
+	"github.com/moby/moby/client/pkg/versions"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
@@ -424,8 +424,8 @@ func (s *composeService) getBuildxPlugin() (*manager.Plugin, error) {
 		return nil, fmt.Errorf("failed to get version of buildx")
 	}
 
-	if versions.LessThan(buildx.Version[1:], BuildxMinVersion) {
-		return nil, fmt.Errorf("compose build requires buildx %s or later", BuildxMinVersion)
+	if versions.LessThan(buildx.Version[1:], buildxMinVersion) {
+		return nil, fmt.Errorf("compose build requires buildx %s or later", buildxMinVersion)
 	}
 
 	return buildx, nil
@@ -447,7 +447,7 @@ type _console struct {
 	*streams.Out
 }
 
-func (c _console) Read(p []byte) (n int, err error) {
+func (c _console) Read([]byte) (n int, err error) {
 	return 0, errors.New("not implemented")
 }
 
@@ -550,7 +550,11 @@ func dockerFilePath(ctxName string, dockerfile string) string {
 	if dockerfile == "" {
 		return ""
 	}
-	if contextType, _ := build.DetectContextType(ctxName); contextType == build.ContextTypeGit {
+	contextType, _ := build.DetectContextType(ctxName)
+	if contextType == build.ContextTypeGit || contextType == build.ContextTypeRemote {
+		return dockerfile
+	}
+	if strings.Contains(ctxName, "://") {
 		return dockerfile
 	}
 	if !filepath.IsAbs(dockerfile) {

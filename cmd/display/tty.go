@@ -176,11 +176,13 @@ func (w *ttyWriter) Start(ctx context.Context, operation string) {
 
 func (w *ttyWriter) Done(operation string, success bool) {
 	w.print()
+	w.done <- true
 	w.mtx.Lock()
 	defer w.mtx.Unlock()
-	w.ticker.Stop()
+	if w.ticker != nil {
+		w.ticker.Stop()
+	}
 	w.operation = ""
-	w.done <- true
 }
 
 func (w *ttyWriter) On(events ...api.Resource) {
@@ -202,12 +204,14 @@ func (w *ttyWriter) On(events ...api.Resource) {
 
 func (w *ttyWriter) event(e api.Resource) {
 	// Suspend print while a build is in progress, to avoid collision with buildkit Display
-	if e.Text == api.StatusBuilding {
-		w.ticker.Stop()
-		w.suspended = true
-	} else if w.suspended {
-		w.ticker.Reset(100 * time.Millisecond)
-		w.suspended = false
+	if w.ticker != nil {
+		if e.Text == api.StatusBuilding {
+			w.ticker.Stop()
+			w.suspended = true
+		} else if w.suspended {
+			w.ticker.Reset(100 * time.Millisecond)
+			w.suspended = false
+		}
 	}
 
 	if last, ok := w.tasks[e.ID]; ok {
@@ -317,10 +321,7 @@ func (w *ttyWriter) printWithDimensions(terminalWidth, terminalHeight int) {
 	allTasks := slices.Collect(w.parentTasks())
 
 	// Available lines: terminal height - 2 (header line + potential "more" line)
-	maxLines := terminalHeight - 2
-	if maxLines < 1 {
-		maxLines = 1
-	}
+	maxLines := max(terminalHeight-2, 1)
 
 	showMore := len(allTasks) > maxLines
 	tasksToShow := allTasks
@@ -335,6 +336,21 @@ func (w *ttyWriter) printWithDimensions(terminalWidth, terminalHeight int) {
 		lines[i] = w.prepareLineData(t)
 		if len(lines[i].timer) > timerLen {
 			timerLen = len(lines[i].timer)
+		}
+	}
+
+	// pad timers so they all have the same visible width
+	for i := range lines {
+		l := &lines[i]
+		if l.timer == "" {
+			continue
+		}
+		timerWidth := utf8.RuneCountInString(l.timer)
+		if timerWidth < timerLen {
+			// Left-pad so the timer's right edge stays aligned on the terminal.
+			// This also prevents stale suffix characters from visually “sticking”
+			// when a previously-rendered timer was wider (e.g. "10.6s" -> "0.0s").
+			l.timer = strings.Repeat(" ", timerLen-timerWidth) + l.timer
 		}
 	}
 
@@ -354,10 +370,7 @@ func (w *ttyWriter) printWithDimensions(terminalWidth, terminalHeight int) {
 	if showMore {
 		moreCount := len(allTasks) - len(tasksToShow)
 		moreText := fmt.Sprintf(" ... %d more", moreCount)
-		pad := terminalWidth - len(moreText)
-		if pad < 0 {
-			pad = 0
-		}
+		pad := max(terminalWidth-len(moreText), 0)
 		_, _ = fmt.Fprintf(w.out, "%s%s\n", moreText, strings.Repeat(" ", pad))
 		numLines++
 	}
@@ -392,10 +405,7 @@ func (w *ttyWriter) applyPadding(lines []lineData, terminalWidth int, timerLen i
 		if l.details != "" {
 			lineLen += 1 + utf8.RuneCountInString(l.details)
 		}
-		l.timerPad = terminalWidth - lineLen - timerLen
-		if l.timerPad < 1 {
-			l.timerPad = 1
-		}
+		l.timerPad = max(terminalWidth-lineLen-timerLen, 1)
 		lines[i] = l
 
 	}
@@ -472,10 +482,7 @@ func truncateDetails(lines []lineData, overflow int) bool {
 	for i := range lines {
 		l := &lines[i]
 		if len(l.details) > 3 {
-			reduction := overflow
-			if reduction > len(l.details)-3 {
-				reduction = len(l.details) - 3
-			}
+			reduction := min(overflow, len(l.details)-3)
 			l.details = l.details[:len(l.details)-reduction-3] + "..."
 			return true
 		} else if l.details != "" {
@@ -504,10 +511,7 @@ func truncateLongestTaskID(lines []lineData, overflow, minIDLen int) bool {
 
 	l := &lines[longestIdx]
 	reduction := overflow + 3 // account for "..."
-	newLen := len(l.taskID) - reduction
-	if newLen < minIDLen-3 {
-		newLen = minIDLen - 3
-	}
+	newLen := max(len(l.taskID)-reduction, minIDLen-3)
 	if newLen > 0 {
 		l.taskID = l.taskID[:newLen] + "..."
 	}
@@ -546,10 +550,7 @@ func (w *ttyWriter) prepareLineData(t *task) lineData {
 			total += child.total
 			current += child.current
 			r := len(percentChars) - 1
-			p := child.percent
-			if p > 100 {
-				p = 100
-			}
+			p := min(child.percent, 100)
 			completion = append(completion, percentChars[r*p/100])
 		}
 	}

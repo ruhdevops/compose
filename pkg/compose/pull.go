@@ -28,13 +28,15 @@ import (
 	"time"
 
 	"github.com/compose-spec/compose-go/v2/types"
+	"github.com/containerd/platforms"
 	"github.com/distribution/reference"
 	"github.com/docker/cli/cli/config/configfile"
 	clitypes "github.com/docker/cli/cli/config/types"
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/jsonmessage"
+	"github.com/docker/go-units"
+	"github.com/moby/moby/api/types/jsonstream"
+	"github.com/moby/moby/client"
 	"github.com/opencontainers/go-digest"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 
@@ -189,9 +191,18 @@ func (s *composeService) pullServiceImage(ctx context.Context, service types.Ser
 		platform = defaultPlatform
 	}
 
-	stream, err := s.apiClient().ImagePull(ctx, service.Image, image.PullOptions{
+	var ociPlatforms []ocispec.Platform
+	if platform != "" {
+		p, err := platforms.Parse(platform)
+		if err != nil {
+			return "", err
+		}
+		ociPlatforms = append(ociPlatforms, p)
+	}
+
+	stream, err := s.apiClient().ImagePull(ctx, service.Image, client.ImagePullOptions{
 		RegistryAuth: encodedAuth,
-		Platform:     platform,
+		Platforms:    ociPlatforms,
 	})
 
 	if ctx.Err() != nil {
@@ -221,7 +232,7 @@ func (s *composeService) pullServiceImage(ctx context.Context, service types.Ser
 
 	dec := json.NewDecoder(stream)
 	for {
-		var jm jsonmessage.JSONMessage
+		var jm jsonstream.Message
 		if err := dec.Decode(&jm); err != nil {
 			if errors.Is(err, io.EOF) {
 				break
@@ -251,7 +262,9 @@ func ImageDigestResolver(ctx context.Context, file *configfile.ConfigFile, apiCl
 		if err != nil {
 			return "", err
 		}
-		inspect, err := apiClient.DistributionInspect(ctx, named.String(), auth)
+		inspect, err := apiClient.DistributionInspect(ctx, named.String(), client.DistributionInspectOptions{
+			EncodedRegistryAuth: auth,
+		})
 		if err != nil {
 			return "",
 				fmt.Errorf("failed to resolve digest for %s: %w", named.String(), err)
@@ -396,20 +409,18 @@ const (
 	PullCompletePhase      = "Pull complete"
 )
 
-func toPullProgressEvent(parent string, jm jsonmessage.JSONMessage, events api.EventProcessor) {
+func toPullProgressEvent(parent string, jm jsonstream.Message, events api.EventProcessor) {
 	if jm.ID == "" || jm.Progress == nil {
 		return
 	}
 
 	var (
-		progress string
-		total    int64
-		percent  int
-		current  int64
-		status   = api.Working
+		details string
+		total   int64
+		percent int
+		current int64
+		status  = api.Working
 	)
-
-	progress = jm.Progress.String()
 
 	switch jm.Status {
 	case PreparingPhase, WaitingPhase, PullingFsPhase:
@@ -419,10 +430,7 @@ func toPullProgressEvent(parent string, jm jsonmessage.JSONMessage, events api.E
 			current = jm.Progress.Current
 			total = jm.Progress.Total
 			if jm.Progress.Total > 0 {
-				percent = int(jm.Progress.Current * 100 / jm.Progress.Total)
-				if percent > 100 {
-					percent = 100
-				}
+				percent = min(int(jm.Progress.Current*100/jm.Progress.Total), 100)
 			}
 		}
 	case DownloadCompletePhase, AlreadyExistsPhase, PullCompletePhase:
@@ -438,7 +446,9 @@ func toPullProgressEvent(parent string, jm jsonmessage.JSONMessage, events api.E
 
 	if jm.Error != nil {
 		status = api.Error
-		progress = jm.Error.Message
+		details = jm.Error.Message
+	} else {
+		details = units.HumanSize(float64(jm.Progress.Current))
 	}
 
 	events.On(api.Resource{
@@ -449,6 +459,6 @@ func toPullProgressEvent(parent string, jm jsonmessage.JSONMessage, events api.E
 		Percent:  percent,
 		Status:   status,
 		Text:     jm.Status,
-		Details:  progress,
+		Details:  details,
 	})
 }
