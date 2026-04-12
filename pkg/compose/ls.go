@@ -23,22 +23,23 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/docker/compose/v2/pkg/api"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/filters"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
 	"github.com/sirupsen/logrus"
+
+	"github.com/docker/compose/v5/pkg/api"
 )
 
 func (s *composeService) List(ctx context.Context, opts api.ListOptions) ([]api.Stack, error) {
-	list, err := s.apiClient().ContainerList(ctx, container.ListOptions{
-		Filters: filters.NewArgs(hasProjectLabelFilter(), hasConfigHashLabel()),
+	list, err := s.apiClient().ContainerList(ctx, client.ContainerListOptions{
+		Filters: make(client.Filters).Add("label", api.ProjectLabel).Add("label", api.ConfigHashLabel),
 		All:     opts.All,
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	return containersToStacks(list)
+	return containersToStacks(list.Items)
 }
 
 func containersToStacks(containers []container.Summary) ([]api.Stack, error) {
@@ -73,7 +74,7 @@ func combinedConfigFiles(containers []container.Summary) (string, error) {
 			return "", fmt.Errorf("no label %q set on container %q of compose project", api.ConfigFilesLabel, c.ID)
 		}
 
-		for _, f := range strings.Split(files, ",") {
+		for f := range strings.SplitSeq(files, ",") {
 			if !slices.Contains(configFiles, f) {
 				configFiles = append(configFiles, f)
 			}
@@ -86,7 +87,7 @@ func combinedConfigFiles(containers []container.Summary) (string, error) {
 func containerToState(containers []container.Summary) []string {
 	statuses := []string{}
 	for _, c := range containers {
-		statuses = append(statuses, c.State)
+		statuses = append(statuses, string(c.State))
 	}
 	return statuses
 }

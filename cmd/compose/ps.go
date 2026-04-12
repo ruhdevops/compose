@@ -24,13 +24,14 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/docker/compose/v2/cmd/formatter"
-	"github.com/docker/compose/v2/pkg/api"
-
 	"github.com/docker/cli/cli/command"
 	cliformatter "github.com/docker/cli/cli/command/formatter"
 	cliflags "github.com/docker/cli/cli/flags"
 	"github.com/spf13/cobra"
+
+	"github.com/docker/compose/v5/cmd/formatter"
+	"github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/compose"
 )
 
 type psOptions struct {
@@ -49,22 +50,22 @@ func (p *psOptions) parseFilter() error {
 	if p.Filter == "" {
 		return nil
 	}
-	parts := strings.SplitN(p.Filter, "=", 2)
-	if len(parts) != 2 {
+	key, val, ok := strings.Cut(p.Filter, "=")
+	if !ok {
 		return errors.New("arguments to --filter should be in form KEY=VAL")
 	}
-	switch parts[0] {
+	switch key {
 	case "status":
-		p.Status = append(p.Status, parts[1])
+		p.Status = append(p.Status, val)
+		return nil
 	case "source":
 		return api.ErrNotImplemented
 	default:
-		return fmt.Errorf("unknown filter %s", parts[0])
+		return fmt.Errorf("unknown filter %s", key)
 	}
-	return nil
 }
 
-func psCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service) *cobra.Command {
+func psCommand(p *ProjectOptions, dockerCli command.Cli, backendOptions *BackendOptions) *cobra.Command {
 	opts := psOptions{
 		ProjectOptions: p,
 	}
@@ -75,7 +76,7 @@ func psCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service) *c
 			return opts.parseFilter()
 		},
 		RunE: Adapt(func(ctx context.Context, args []string) error {
-			return runPs(ctx, dockerCli, backend, args, opts)
+			return runPs(ctx, dockerCli, backendOptions, args, opts)
 		}),
 		ValidArgsFunction: completeServiceNames(dockerCli, p),
 	}
@@ -91,7 +92,7 @@ func psCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service) *c
 	return psCmd
 }
 
-func runPs(ctx context.Context, dockerCli command.Cli, backend api.Service, services []string, opts psOptions) error {
+func runPs(ctx context.Context, dockerCli command.Cli, backendOptions *BackendOptions, services []string, opts psOptions) error { //nolint:gocyclo
 	project, name, err := opts.projectOrName(ctx, dockerCli, services...)
 	if err != nil {
 		return err
@@ -111,6 +112,10 @@ func runPs(ctx context.Context, dockerCli command.Cli, backend api.Service, serv
 		}
 	}
 
+	backend, err := compose.NewComposeService(dockerCli, backendOptions.Options...)
+	if err != nil {
+		return err
+	}
 	containers, err := backend.Ps(ctx, name, api.PsOptions{
 		Project:  project,
 		All:      opts.All || len(opts.Status) != 0,
@@ -162,18 +167,9 @@ func runPs(ctx context.Context, dockerCli command.Cli, backend api.Service, serv
 func filterByStatus(containers []api.ContainerSummary, statuses []string) []api.ContainerSummary {
 	var filtered []api.ContainerSummary
 	for _, c := range containers {
-		if hasStatus(c, statuses) {
+		if slices.Contains(statuses, string(c.State)) {
 			filtered = append(filtered, c)
 		}
 	}
 	return filtered
-}
-
-func hasStatus(c api.ContainerSummary, statuses []string) bool {
-	for _, status := range statuses {
-		if c.State == status {
-			return true
-		}
-	}
-	return false
 }

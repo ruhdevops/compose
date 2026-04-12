@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 
@@ -30,12 +31,12 @@ import (
 	"github.com/compose-spec/compose-go/v2/template"
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/docker/cli/cli/command"
-	"github.com/docker/compose/v2/cmd/formatter"
 	"github.com/spf13/cobra"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v4"
 
-	"github.com/docker/compose/v2/pkg/api"
-	"github.com/docker/compose/v2/pkg/compose"
+	"github.com/docker/compose/v5/cmd/formatter"
+	"github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/compose"
 )
 
 type configOptions struct {
@@ -61,19 +62,19 @@ type configOptions struct {
 	lockImageDigests    bool
 }
 
-func (o *configOptions) ToProject(ctx context.Context, dockerCli command.Cli, services []string, po ...cli.ProjectOptionsFn) (*types.Project, error) {
-	po = append(po, o.ToProjectOptions()...)
-	project, _, err := o.ProjectOptions.ToProject(ctx, dockerCli, services, po...)
+func (o *configOptions) ToProject(ctx context.Context, dockerCli command.Cli, backend api.Compose, services []string) (*types.Project, error) {
+	project, _, err := o.ProjectOptions.ToProject(ctx, dockerCli, backend, services, o.toProjectOptionsFns()...)
 	return project, err
 }
 
 func (o *configOptions) ToModel(ctx context.Context, dockerCli command.Cli, services []string, po ...cli.ProjectOptionsFn) (map[string]any, error) {
-	po = append(po, o.ToProjectOptions()...)
+	po = append(po, o.toProjectOptionsFns()...)
 	return o.ProjectOptions.ToModel(ctx, dockerCli, services, po...)
 }
 
-func (o *configOptions) ToProjectOptions() []cli.ProjectOptionsFn {
-	return []cli.ProjectOptionsFn{
+// toProjectOptionsFns converts config options to cli.ProjectOptionsFn
+func (o *configOptions) toProjectOptionsFns() []cli.ProjectOptionsFn {
+	fns := []cli.ProjectOptionsFn{
 		cli.WithInterpolation(!o.noInterpolate),
 		cli.WithResolvedPaths(!o.noResolvePath),
 		cli.WithNormalization(!o.noNormalize),
@@ -81,6 +82,10 @@ func (o *configOptions) ToProjectOptions() []cli.ProjectOptionsFn {
 		cli.WithDefaultProfiles(o.Profiles...),
 		cli.WithDiscardEnvFile,
 	}
+	if o.noResolveEnv {
+		fns = append(fns, cli.WithoutEnvironmentResolution)
+	}
+	return fns
 }
 
 func configCommand(p *ProjectOptions, dockerCli command.Cli) *cobra.Command {
@@ -197,7 +202,12 @@ func runConfig(ctx context.Context, dockerCli command.Cli, opts configOptions, s
 }
 
 func runConfigInterpolate(ctx context.Context, dockerCli command.Cli, opts configOptions, services []string) ([]byte, error) {
-	project, err := opts.ToProject(ctx, dockerCli, services)
+	backend, err := compose.NewComposeService(dockerCli)
+	if err != nil {
+		return nil, err
+	}
+
+	project, err := opts.ToProject(ctx, dockerCli, backend, services)
 	if err != nil {
 		return nil, err
 	}
@@ -324,17 +334,16 @@ func resolveImageDigests(ctx context.Context, dockerCli command.Cli, model map[s
 func formatModel(model map[string]any, format string) (content []byte, err error) {
 	switch format {
 	case "json":
-		content, err = json.MarshalIndent(model, "", "  ")
+		return json.MarshalIndent(model, "", "  ")
 	case "yaml":
 		buf := bytes.NewBuffer([]byte{})
 		encoder := yaml.NewEncoder(buf)
 		encoder.SetIndent(2)
 		err = encoder.Encode(model)
-		content = buf.Bytes()
+		return buf.Bytes(), err
 	default:
 		return nil, fmt.Errorf("unsupported format %q", format)
 	}
-	return
 }
 
 func runServices(ctx context.Context, dockerCli command.Cli, opts configOptions) error {
@@ -354,7 +363,12 @@ func runServices(ctx context.Context, dockerCli command.Cli, opts configOptions)
 		return nil
 	}
 
-	project, err := opts.ToProject(ctx, dockerCli, nil, cli.WithoutEnvironmentResolution)
+	backend, err := compose.NewComposeService(dockerCli)
+	if err != nil {
+		return err
+	}
+
+	project, _, err := opts.ProjectOptions.ToProject(ctx, dockerCli, backend, nil, cli.WithoutEnvironmentResolution)
 	if err != nil {
 		return err
 	}
@@ -367,7 +381,12 @@ func runServices(ctx context.Context, dockerCli command.Cli, opts configOptions)
 }
 
 func runVolumes(ctx context.Context, dockerCli command.Cli, opts configOptions) error {
-	project, err := opts.ToProject(ctx, dockerCli, nil, cli.WithoutEnvironmentResolution)
+	backend, err := compose.NewComposeService(dockerCli)
+	if err != nil {
+		return err
+	}
+
+	project, _, err := opts.ProjectOptions.ToProject(ctx, dockerCli, backend, nil, cli.WithoutEnvironmentResolution)
 	if err != nil {
 		return err
 	}
@@ -378,7 +397,12 @@ func runVolumes(ctx context.Context, dockerCli command.Cli, opts configOptions) 
 }
 
 func runNetworks(ctx context.Context, dockerCli command.Cli, opts configOptions) error {
-	project, err := opts.ToProject(ctx, dockerCli, nil, cli.WithoutEnvironmentResolution)
+	backend, err := compose.NewComposeService(dockerCli)
+	if err != nil {
+		return err
+	}
+
+	project, _, err := opts.ProjectOptions.ToProject(ctx, dockerCli, backend, nil, cli.WithoutEnvironmentResolution)
 	if err != nil {
 		return err
 	}
@@ -389,7 +413,12 @@ func runNetworks(ctx context.Context, dockerCli command.Cli, opts configOptions)
 }
 
 func runModels(ctx context.Context, dockerCli command.Cli, opts configOptions) error {
-	project, err := opts.ToProject(ctx, dockerCli, nil, cli.WithoutEnvironmentResolution)
+	backend, err := compose.NewComposeService(dockerCli)
+	if err != nil {
+		return err
+	}
+
+	project, _, err := opts.ProjectOptions.ToProject(ctx, dockerCli, backend, nil, cli.WithoutEnvironmentResolution)
 	if err != nil {
 		return err
 	}
@@ -406,7 +435,13 @@ func runHash(ctx context.Context, dockerCli command.Cli, opts configOptions) err
 	if opts.hash != "*" {
 		services = append(services, strings.Split(opts.hash, ",")...)
 	}
-	project, err := opts.ToProject(ctx, dockerCli, nil, cli.WithoutEnvironmentResolution)
+
+	backend, err := compose.NewComposeService(dockerCli)
+	if err != nil {
+		return err
+	}
+
+	project, _, err := opts.ProjectOptions.ToProject(ctx, dockerCli, backend, nil, cli.WithoutEnvironmentResolution)
 	if err != nil {
 		return err
 	}
@@ -420,9 +455,7 @@ func runHash(ctx context.Context, dockerCli command.Cli, opts configOptions) err
 	}
 
 	sorted := services
-	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i] < sorted[j]
-	})
+	slices.Sort(sorted)
 
 	for _, name := range sorted {
 		s, err := project.GetService(name)
@@ -441,7 +474,13 @@ func runHash(ctx context.Context, dockerCli command.Cli, opts configOptions) err
 
 func runProfiles(ctx context.Context, dockerCli command.Cli, opts configOptions, services []string) error {
 	set := map[string]struct{}{}
-	project, err := opts.ToProject(ctx, dockerCli, services, cli.WithoutEnvironmentResolution)
+
+	backend, err := compose.NewComposeService(dockerCli)
+	if err != nil {
+		return err
+	}
+
+	project, err := opts.ToProject(ctx, dockerCli, backend, services)
 	if err != nil {
 		return err
 	}
@@ -462,7 +501,12 @@ func runProfiles(ctx context.Context, dockerCli command.Cli, opts configOptions,
 }
 
 func runConfigImages(ctx context.Context, dockerCli command.Cli, opts configOptions, services []string) error {
-	project, err := opts.ToProject(ctx, dockerCli, services, cli.WithoutEnvironmentResolution)
+	backend, err := compose.NewComposeService(dockerCli)
+	if err != nil {
+		return err
+	}
+
+	project, err := opts.ToProject(ctx, dockerCli, backend, services)
 	if err != nil {
 		return err
 	}
@@ -499,7 +543,12 @@ func runVariables(ctx context.Context, dockerCli command.Cli, opts configOptions
 }
 
 func runEnvironment(ctx context.Context, dockerCli command.Cli, opts configOptions, services []string) error {
-	project, err := opts.ToProject(ctx, dockerCli, services)
+	backend, err := compose.NewComposeService(dockerCli)
+	if err != nil {
+		return err
+	}
+
+	project, err := opts.ToProject(ctx, dockerCli, backend, services)
 	if err != nil {
 		return err
 	}

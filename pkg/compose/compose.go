@@ -20,51 +20,203 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
+	"io"
 	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/compose-spec/compose-go/v2/types"
+	"github.com/docker/buildx/store/storeutil"
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/cli/cli/config/configfile"
 	"github.com/docker/cli/cli/flags"
 	"github.com/docker/cli/cli/streams"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/api/types/swarm"
-	"github.com/docker/docker/api/types/volume"
-	"github.com/docker/docker/client"
 	"github.com/jonboulle/clockwork"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/swarm"
+	"github.com/moby/moby/client"
+	"github.com/sirupsen/logrus"
 
-	"github.com/docker/compose/v2/pkg/api"
+	"github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/dryrun"
 )
 
-var stdioToStdout bool
+type Option func(service *composeService) error
 
-func init() {
-	out, ok := os.LookupEnv("COMPOSE_STATUS_STDOUT")
-	if ok {
-		stdioToStdout, _ = strconv.ParseBool(out)
-	}
-}
-
-// NewComposeService create a local implementation of the compose.Service API
-func NewComposeService(dockerCli command.Cli) api.Service {
-	return &composeService{
+// NewComposeService creates a Compose service using Docker CLI.
+// This is the standard constructor that requires command.Cli for full functionality.
+//
+// Example usage:
+//
+//	dockerCli, _ := command.NewDockerCli()
+//	service := NewComposeService(dockerCli)
+//
+// For advanced configuration with custom overrides, use ServiceOption functions:
+//
+//	service := NewComposeService(dockerCli,
+//	    WithPrompt(prompt.NewPrompt(cli.In(), cli.Out()).Confirm),
+//	    WithOutputStream(customOut),
+//	    WithErrorStream(customErr),
+//	    WithInputStream(customIn))
+//
+// Or set all streams at once:
+//
+//	service := NewComposeService(dockerCli,
+//	    WithStreams(customOut, customErr, customIn))
+func NewComposeService(dockerCli command.Cli, options ...Option) (api.Compose, error) {
+	s := &composeService{
 		dockerCli:      dockerCli,
 		clock:          clockwork.NewRealClock(),
 		maxConcurrency: -1,
 		dryRun:         false,
 	}
+	for _, option := range options {
+		if err := option(s); err != nil {
+			return nil, err
+		}
+	}
+	if s.prompt == nil {
+		s.prompt = func(message string, defaultValue bool) (bool, error) {
+			fmt.Println(message)
+			logrus.Warning("Compose is running without a 'prompt' component to interact with user")
+			return defaultValue, nil
+		}
+	}
+	if s.events == nil {
+		s.events = &ignore{}
+	}
+
+	// If custom streams were provided, wrap the Docker CLI to use them
+	if s.outStream != nil || s.errStream != nil || s.inStream != nil {
+		s.dockerCli = s.wrapDockerCliWithStreams(dockerCli)
+	}
+
+	return s, nil
+}
+
+// WithStreams sets custom I/O streams for output and interaction
+func WithStreams(out, err io.Writer, in io.Reader) Option {
+	return func(s *composeService) error {
+		s.outStream = out
+		s.errStream = err
+		s.inStream = in
+		return nil
+	}
+}
+
+// WithOutputStream sets a custom output stream
+func WithOutputStream(out io.Writer) Option {
+	return func(s *composeService) error {
+		s.outStream = out
+		return nil
+	}
+}
+
+// WithErrorStream sets a custom error stream
+func WithErrorStream(err io.Writer) Option {
+	return func(s *composeService) error {
+		s.errStream = err
+		return nil
+	}
+}
+
+// WithInputStream sets a custom input stream
+func WithInputStream(in io.Reader) Option {
+	return func(s *composeService) error {
+		s.inStream = in
+		return nil
+	}
+}
+
+// WithContextInfo sets custom Docker context information
+func WithContextInfo(info api.ContextInfo) Option {
+	return func(s *composeService) error {
+		s.contextInfo = info
+		return nil
+	}
+}
+
+// WithProxyConfig sets custom HTTP proxy configuration for builds
+func WithProxyConfig(config map[string]string) Option {
+	return func(s *composeService) error {
+		s.proxyConfig = config
+		return nil
+	}
+}
+
+// WithPrompt configure a UI component for Compose service to interact with user and confirm actions
+func WithPrompt(prompt Prompt) Option {
+	return func(s *composeService) error {
+		s.prompt = prompt
+		return nil
+	}
+}
+
+// WithMaxConcurrency defines upper limit for concurrent operations against engine API
+func WithMaxConcurrency(maxConcurrency int) Option {
+	return func(s *composeService) error {
+		s.maxConcurrency = maxConcurrency
+		return nil
+	}
+}
+
+// WithDryRun configure Compose to run without actually applying changes
+func WithDryRun(s *composeService) error {
+	s.dryRun = true
+	cli, err := command.NewDockerCli()
+	if err != nil {
+		return err
+	}
+
+	options := flags.NewClientOptions()
+	options.Context = s.dockerCli.CurrentContext()
+	err = cli.Initialize(options, command.WithInitializeClient(func(cli *command.DockerCli) (client.APIClient, error) {
+		return dryrun.NewDryRunClient(s.apiClient(), s.dockerCli)
+	}))
+	if err != nil {
+		return err
+	}
+	s.dockerCli = cli
+	return nil
+}
+
+type Prompt func(message string, defaultValue bool) (bool, error)
+
+// AlwaysOkPrompt returns a Prompt implementation that always returns true without user interaction.
+func AlwaysOkPrompt() Prompt {
+	return func(message string, defaultValue bool) (bool, error) {
+		return true, nil
+	}
+}
+
+// WithEventProcessor configure component to get notified on Compose operation and progress events.
+// Typically used to configure a progress UI
+func WithEventProcessor(bus api.EventProcessor) Option {
+	return func(s *composeService) error {
+		s.events = bus
+		return nil
+	}
 }
 
 type composeService struct {
-	dockerCli      command.Cli
+	dockerCli command.Cli
+	// prompt is used to interact with user and confirm actions
+	prompt Prompt
+	// eventBus collects tasks execution events
+	events api.EventProcessor
+
+	// Optional overrides for specific components (for SDK users)
+	outStream   io.Writer
+	errStream   io.Writer
+	inStream    io.Reader
+	contextInfo api.ContextInfo
+	proxyConfig map[string]string
+
 	clock          clockwork.Clock
 	maxConcurrency int
 	dryRun         bool
+
+	runtimeAPIVersion runtimeVersionCache
 }
 
 // Close releases any connections/resources held by the underlying clients.
@@ -74,7 +226,7 @@ type composeService struct {
 func (s *composeService) Close() error {
 	var errs []error
 	if s.dockerCli != nil {
-		errs = append(errs, s.dockerCli.Client().Close())
+		errs = append(errs, s.apiClient().Close())
 	}
 	return errors.Join(errs...)
 }
@@ -87,29 +239,20 @@ func (s *composeService) configFile() *configfile.ConfigFile {
 	return s.dockerCli.ConfigFile()
 }
 
-func (s *composeService) MaxConcurrency(i int) {
-	s.maxConcurrency = i
+// getContextInfo returns the context info - either custom override or dockerCli adapter
+func (s *composeService) getContextInfo() api.ContextInfo {
+	if s.contextInfo != nil {
+		return s.contextInfo
+	}
+	return &dockerCliContextInfo{cli: s.dockerCli}
 }
 
-func (s *composeService) DryRunMode(ctx context.Context, dryRun bool) (context.Context, error) {
-	s.dryRun = dryRun
-	if dryRun {
-		cli, err := command.NewDockerCli()
-		if err != nil {
-			return ctx, err
-		}
-
-		options := flags.NewClientOptions()
-		options.Context = s.dockerCli.CurrentContext()
-		err = cli.Initialize(options, command.WithInitializeClient(func(cli *command.DockerCli) (client.APIClient, error) {
-			return api.NewDryRunClient(s.apiClient(), s.dockerCli)
-		}))
-		if err != nil {
-			return ctx, err
-		}
-		s.dockerCli = cli
+// getProxyConfig returns the proxy config - either custom override or environment-based
+func (s *composeService) getProxyConfig() map[string]string {
+	if s.proxyConfig != nil {
+		return s.proxyConfig
 	}
-	return context.WithValue(ctx, api.DryRunKey{}, dryRun), nil
+	return storeutil.GetProxyConfig(s.dockerCli)
 }
 
 func (s *composeService) stdout() *streams.Out {
@@ -124,11 +267,66 @@ func (s *composeService) stderr() *streams.Out {
 	return s.dockerCli.Err()
 }
 
-func (s *composeService) stdinfo() *streams.Out {
-	if stdioToStdout {
-		return s.dockerCli.Out()
+// readCloserAdapter adapts io.Reader to io.ReadCloser
+type readCloserAdapter struct {
+	r io.Reader
+}
+
+func (r *readCloserAdapter) Read(p []byte) (int, error) {
+	return r.r.Read(p)
+}
+
+func (r *readCloserAdapter) Close() error {
+	return nil
+}
+
+// wrapDockerCliWithStreams wraps the Docker CLI to intercept and override stream methods
+func (s *composeService) wrapDockerCliWithStreams(baseCli command.Cli) command.Cli {
+	wrapper := &streamOverrideWrapper{
+		Cli: baseCli,
 	}
-	return s.dockerCli.Err()
+
+	// Wrap custom streams in Docker CLI's stream types
+	if s.outStream != nil {
+		wrapper.outStream = streams.NewOut(s.outStream)
+	}
+	if s.errStream != nil {
+		wrapper.errStream = streams.NewOut(s.errStream)
+	}
+	if s.inStream != nil {
+		wrapper.inStream = streams.NewIn(&readCloserAdapter{r: s.inStream})
+	}
+
+	return wrapper
+}
+
+// streamOverrideWrapper wraps command.Cli to override streams with custom implementations
+type streamOverrideWrapper struct {
+	command.Cli
+	outStream *streams.Out
+	errStream *streams.Out
+	inStream  *streams.In
+}
+
+func (w *streamOverrideWrapper) Out() *streams.Out {
+	if w.outStream != nil {
+		return w.outStream
+	}
+	return w.Cli.Out()
+}
+
+func (w *streamOverrideWrapper) Err() *streams.Out {
+	if w.errStream != nil {
+		return w.errStream
+	}
+	return w.Cli.Err()
+}
+
+func (w *streamOverrideWrapper) In() *streams.In {
+	if w.inStream != nil {
+		return w.inStream
+	}
+	return w.Cli.In()
 }
 
 func getCanonicalContainerName(c container.Summary) string {
@@ -187,7 +385,7 @@ func (s *composeService) projectFromName(containers Containers, projectName stri
 		dependencies := service.Labels[api.DependenciesLabel]
 		if dependencies != "" {
 			service.DependsOn = types.DependsOnConfig{}
-			for _, dc := range strings.Split(dependencies, ",") {
+			for dc := range strings.SplitSeq(dependencies, ",") {
 				dcArr := strings.Split(dc, ":")
 				condition := ServiceConditionRunningOrHealthy
 				// Let's restart the dependency by default if we don't have the info stored in the label
@@ -235,8 +433,8 @@ func increment(scale *int) *int {
 }
 
 func (s *composeService) actualVolumes(ctx context.Context, projectName string) (types.Volumes, error) {
-	opts := volume.ListOptions{
-		Filters: filters.NewArgs(projectFilter(projectName)),
+	opts := client.VolumeListOptions{
+		Filters: projectFilter(projectName),
 	}
 	volumes, err := s.apiClient().VolumeList(ctx, opts)
 	if err != nil {
@@ -244,7 +442,7 @@ func (s *composeService) actualVolumes(ctx context.Context, projectName string) 
 	}
 
 	actual := types.Volumes{}
-	for _, vol := range volumes.Volumes {
+	for _, vol := range volumes.Items {
 		actual[vol.Labels[api.VolumeLabel]] = types.VolumeConfig{
 			Name:   vol.Name,
 			Driver: vol.Driver,
@@ -255,15 +453,15 @@ func (s *composeService) actualVolumes(ctx context.Context, projectName string) 
 }
 
 func (s *composeService) actualNetworks(ctx context.Context, projectName string) (types.Networks, error) {
-	networks, err := s.apiClient().NetworkList(ctx, network.ListOptions{
-		Filters: filters.NewArgs(projectFilter(projectName)),
+	networks, err := s.apiClient().NetworkList(ctx, client.NetworkListOptions{
+		Filters: projectFilter(projectName),
 	})
 	if err != nil {
 		return nil, err
 	}
 
 	actual := types.Networks{}
-	for _, net := range networks {
+	for _, net := range networks.Items {
 		actual[net.Labels[api.NetworkLabel]] = types.NetworkConfig{
 			Name:   net.Name,
 			Driver: net.Driver,
@@ -279,13 +477,13 @@ var swarmEnabled = struct {
 	err  error
 }{}
 
-func (s *composeService) isSWarmEnabled(ctx context.Context) (bool, error) {
+func (s *composeService) isSwarmEnabled(ctx context.Context) (bool, error) {
 	swarmEnabled.once.Do(func() {
-		info, err := s.apiClient().Info(ctx)
+		res, err := s.apiClient().Info(ctx, client.InfoOptions{})
 		if err != nil {
 			swarmEnabled.err = err
 		}
-		switch info.Swarm.LocalNodeState {
+		switch res.Info.Swarm.LocalNodeState {
 		case swarm.LocalNodeStateInactive, swarm.LocalNodeStateLocked:
 			swarmEnabled.val = false
 		default:
@@ -295,21 +493,39 @@ func (s *composeService) isSWarmEnabled(ctx context.Context) (bool, error) {
 	return swarmEnabled.val, swarmEnabled.err
 }
 
+// runtimeVersionCache caches a version string after a successful lookup.
+// Errors (including context cancellation) are not cached so that
+// subsequent calls can retry with a fresh context.
 type runtimeVersionCache struct {
-	once sync.Once
-	val  string
-	err  error
+	mu  sync.Mutex
+	val string
 }
 
-var runtimeVersion runtimeVersionCache
+// RuntimeAPIVersion returns the negotiated API version that will be used for
+// requests to the Docker daemon. It triggers version negotiation via Ping so
+// that version-gated request shaping matches the version subsequent API calls
+// will actually use.
+//
+// After negotiation, Compose should never rely on features or request attributes
+// not defined by this API version, even if the daemon's raw version is higher.
+func (s *composeService) RuntimeAPIVersion(ctx context.Context) (string, error) {
+	s.runtimeAPIVersion.mu.Lock()
+	defer s.runtimeAPIVersion.mu.Unlock()
+	if s.runtimeAPIVersion.val != "" {
+		return s.runtimeAPIVersion.val, nil
+	}
 
-func (s *composeService) RuntimeVersion(ctx context.Context) (string, error) {
-	runtimeVersion.once.Do(func() {
-		version, err := s.dockerCli.Client().ServerVersion(ctx)
-		if err != nil {
-			runtimeVersion.err = err
-		}
-		runtimeVersion.val = version.APIVersion
-	})
-	return runtimeVersion.val, runtimeVersion.err
+	cli := s.apiClient()
+	_, err := cli.Ping(ctx, client.PingOptions{NegotiateAPIVersion: true})
+	if err != nil {
+		return "", err
+	}
+
+	version := cli.ClientVersion()
+	if version == "" {
+		return "", fmt.Errorf("docker client returned empty version after successful API negotiation")
+	}
+
+	s.runtimeAPIVersion.val = version
+	return s.runtimeAPIVersion.val, nil
 }

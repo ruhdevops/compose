@@ -30,9 +30,10 @@ import (
 	"github.com/compose-spec/compose-go/v2/template"
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/docker/cli/cli/command"
-	"github.com/docker/compose/v2/internal/tracing"
-	ui "github.com/docker/compose/v2/pkg/progress"
-	"github.com/docker/compose/v2/pkg/prompt"
+
+	"github.com/docker/compose/v5/cmd/display"
+	"github.com/docker/compose/v5/cmd/prompt"
+	"github.com/docker/compose/v5/internal/tracing"
 )
 
 func applyPlatforms(project *types.Project, buildForSinglePlatform bool) error {
@@ -212,9 +213,9 @@ func extractEnvCLIDefined(cmdEnvs []string) map[string]string {
 	// Parse command-line environment variables
 	cmdEnvMap := make(map[string]string)
 	for _, env := range cmdEnvs {
-		parts := strings.SplitN(env, "=", 2)
-		if len(parts) == 2 {
-			cmdEnvMap[parts[0]] = parts[1]
+		key, val, ok := strings.Cut(env, "=")
+		if ok {
+			cmdEnvMap[key] = val
 		}
 	}
 	return cmdEnvMap
@@ -247,7 +248,7 @@ func displayInterpolationVariables(writer io.Writer, varsInfo []varInfo) {
 
 func displayLocationRemoteStack(dockerCli command.Cli, project *types.Project, options buildOptions) {
 	mainComposeFile := options.ProjectOptions.ConfigPaths[0] //nolint:staticcheck
-	if ui.Mode != ui.ModeQuiet && ui.Mode != ui.ModeJSON {
+	if display.Mode != display.ModeQuiet && display.Mode != display.ModeJSON {
 		_, _ = fmt.Fprintf(dockerCli.Out(), "Your compose stack %q is stored in %q\n", mainComposeFile, project.WorkingDir)
 	}
 }

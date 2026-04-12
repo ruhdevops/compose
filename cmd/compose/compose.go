@@ -32,23 +32,25 @@ import (
 	"github.com/compose-spec/compose-go/v2/cli"
 	"github.com/compose-spec/compose-go/v2/dotenv"
 	"github.com/compose-spec/compose-go/v2/loader"
+	composepaths "github.com/compose-spec/compose-go/v2/paths"
 	"github.com/compose-spec/compose-go/v2/types"
 	composegoutils "github.com/compose-spec/compose-go/v2/utils"
-	"github.com/docker/buildx/util/logutil"
 	dockercli "github.com/docker/cli/cli"
 	"github.com/docker/cli/cli-plugins/metadata"
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/cli/pkg/kvfile"
-	"github.com/docker/compose/v2/cmd/formatter"
-	"github.com/docker/compose/v2/internal/tracing"
-	"github.com/docker/compose/v2/pkg/api"
-	ui "github.com/docker/compose/v2/pkg/progress"
-	"github.com/docker/compose/v2/pkg/remote"
-	"github.com/docker/compose/v2/pkg/utils"
 	"github.com/morikuni/aec"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+
+	"github.com/docker/compose/v5/cmd/display"
+	"github.com/docker/compose/v5/cmd/formatter"
+	"github.com/docker/compose/v5/internal/tracing"
+	"github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/compose"
+	"github.com/docker/compose/v5/pkg/remote"
+	"github.com/docker/compose/v5/pkg/utils"
 )
 
 const (
@@ -57,7 +59,7 @@ const (
 	// ComposeProjectName define the project name to be used, instead of guessing from parent directory
 	ComposeProjectName = "COMPOSE_PROJECT_NAME"
 	// ComposeCompatibility try to mimic compose v1 as much as possible
-	ComposeCompatibility = "COMPOSE_COMPATIBILITY"
+	ComposeCompatibility = api.ComposeCompatibility
 	// ComposeRemoveOrphans remove "orphaned" containers, i.e. containers tagged for current project but not declared as service
 	ComposeRemoveOrphans = "COMPOSE_REMOVE_ORPHANS"
 	// ComposeIgnoreOrphans ignore "orphaned" containers
@@ -83,10 +85,16 @@ func rawEnv(r io.Reader, filename string, vars map[string]string, lookup func(ke
 	return nil
 }
 
+var stdioToStdout bool
+
 func init() {
 	// compose evaluates env file values for interpolation
 	// `raw` format allows to load env_file with the same parser used by docker run --env-file
 	dotenv.RegisterFormat("raw", rawEnv)
+
+	if v, ok := os.LookupEnv("COMPOSE_STATUS_STDOUT"); ok {
+		stdioToStdout, _ = strconv.ParseBool(v)
+	}
 }
 
 // Command defines a compose CLI command as a func with args
@@ -115,7 +123,7 @@ func AdaptCmd(fn CobraCommand) func(cmd *cobra.Command, args []string) error {
 				StatusCode: 130,
 			}
 		}
-		if ui.Mode == ui.ModeJSON {
+		if display.Mode == display.ModeJSON {
 			err = makeJSONError(err)
 		}
 		return err
@@ -130,16 +138,17 @@ func Adapt(fn Command) func(cmd *cobra.Command, args []string) error {
 }
 
 type ProjectOptions struct {
-	ProjectName   string
-	Profiles      []string
-	ConfigPaths   []string
-	WorkDir       string
-	ProjectDir    string
-	EnvFiles      []string
-	Compatibility bool
-	Progress      string
-	Offline       bool
-	All           bool
+	ProjectName        string
+	Profiles           []string
+	ConfigPaths        []string
+	WorkDir            string
+	ProjectDir         string
+	EnvFiles           []string
+	Compatibility      bool
+	Progress           string
+	Offline            bool
+	All                bool
+	insecureRegistries []string
 }
 
 // ProjectFunc does stuff within a types.Project
@@ -157,13 +166,13 @@ func (o *ProjectOptions) WithProject(fn ProjectFunc, dockerCli command.Cli) func
 
 // WithServices creates a cobra run command from a ProjectFunc based on configured project options and selected services
 func (o *ProjectOptions) WithServices(dockerCli command.Cli, fn ProjectServicesFunc) func(cmd *cobra.Command, args []string) error {
-	return Adapt(func(ctx context.Context, args []string) error {
-		options := []cli.ProjectOptionsFn{
-			cli.WithResolvedPaths(true),
-			cli.WithoutEnvironmentResolution,
+	return Adapt(func(ctx context.Context, services []string) error {
+		backend, err := compose.NewComposeService(dockerCli)
+		if err != nil {
+			return err
 		}
 
-		project, metrics, err := o.ToProject(ctx, dockerCli, args, options...)
+		project, metrics, err := o.ToProject(ctx, dockerCli, backend, services, cli.WithoutEnvironmentResolution)
 		if err != nil {
 			return err
 		}
@@ -175,7 +184,7 @@ func (o *ProjectOptions) WithServices(dockerCli command.Cli, fn ProjectServicesF
 			return err
 		}
 
-		return fn(ctx, project, args)
+		return fn(ctx, project, services)
 	})
 }
 
@@ -215,6 +224,8 @@ func (o *ProjectOptions) addProjectFlags(f *pflag.FlagSet) {
 	f.StringArrayVar(&o.Profiles, "profile", []string{}, "Specify a profile to enable")
 	f.StringVarP(&o.ProjectName, "project-name", "p", "", "Project name")
 	f.StringArrayVarP(&o.ConfigPaths, "file", "f", []string{}, "Compose configuration files")
+	f.StringArrayVar(&o.insecureRegistries, "insecure-registry", []string{}, "Use insecure registry to pull Compose OCI artifacts. Doesn't apply to images")
+	_ = f.MarkHidden("insecure-registry")
 	f.StringArrayVar(&o.EnvFiles, "env-file", defaultStringArrayVar(ComposeEnvFiles), "Specify an alternate environment file")
 	f.StringVar(&o.ProjectDir, "project-directory", "", "Specify an alternate working directory\n(default: the path of the, first specified, Compose file)")
 	f.StringVar(&o.WorkDir, "workdir", "", "DEPRECATED! USE --project-directory INSTEAD.\nSpecify an alternate working directory\n(default: the path of the, first specified, Compose file)")
@@ -235,7 +246,12 @@ func (o *ProjectOptions) projectOrName(ctx context.Context, dockerCli command.Cl
 	name := o.ProjectName
 	var project *types.Project
 	if len(o.ConfigPaths) > 0 || o.ProjectName == "" {
-		p, _, err := o.ToProject(ctx, dockerCli, services, cli.WithDiscardEnvFile, cli.WithoutEnvironmentResolution)
+		backend, err := compose.NewComposeService(dockerCli)
+		if err != nil {
+			return nil, "", err
+		}
+
+		p, _, err := o.ToProject(ctx, dockerCli, backend, services, cli.WithDiscardEnvFile, cli.WithoutEnvironmentResolution)
 		if err != nil {
 			envProjectName := os.Getenv(ComposeProjectName)
 			if envProjectName != "" {
@@ -259,7 +275,12 @@ func (o *ProjectOptions) toProjectName(ctx context.Context, dockerCli command.Cl
 		return envProjectName, nil
 	}
 
-	project, _, err := o.ToProject(ctx, dockerCli, nil)
+	backend, err := compose.NewComposeService(dockerCli)
+	if err != nil {
+		return "", err
+	}
+
+	project, _, err := o.ToProject(ctx, dockerCli, backend, nil)
 	if err != nil {
 		return "", err
 	}
@@ -284,19 +305,14 @@ func (o *ProjectOptions) ToModel(ctx context.Context, dockerCli command.Cli, ser
 	return options.LoadModel(ctx)
 }
 
-func (o *ProjectOptions) ToProject(ctx context.Context, dockerCli command.Cli, services []string, po ...cli.ProjectOptionsFn) (*types.Project, tracing.Metrics, error) { //nolint:gocyclo
+// ToProject loads a Compose project using the LoadProject API.
+// Accepts optional cli.ProjectOptionsFn to control loader behavior.
+func (o *ProjectOptions) ToProject(ctx context.Context, dockerCli command.Cli, backend api.Compose, services []string, po ...cli.ProjectOptionsFn) (*types.Project, tracing.Metrics, error) {
 	var metrics tracing.Metrics
 	remotes := o.remoteLoaders(dockerCli)
-	for _, r := range remotes {
-		po = append(po, cli.WithResourceLoader(r))
-	}
 
-	options, err := o.toProjectOptions(po...)
-	if err != nil {
-		return nil, metrics, err
-	}
-
-	options.WithListeners(func(event string, metadata map[string]any) {
+	// Setup metrics listener to collect project data
+	metricsListener := func(event string, metadata map[string]any) {
 		switch event {
 		case "extends":
 			metrics.CountExtends++
@@ -317,50 +333,31 @@ func (o *ProjectOptions) ToProject(ctx context.Context, dockerCli command.Cli, s
 				}
 			}
 		}
-	})
-
-	if o.Compatibility || utils.StringToBool(options.Environment[ComposeCompatibility]) {
-		api.Separator = "_"
 	}
 
-	project, err := options.LoadProject(ctx)
+	loadOpts := api.ProjectLoadOptions{
+		ProjectName:       o.ProjectName,
+		ConfigPaths:       o.ConfigPaths,
+		WorkingDir:        o.ProjectDir,
+		EnvFiles:          o.EnvFiles,
+		Profiles:          o.Profiles,
+		Services:          services,
+		Offline:           o.Offline,
+		All:               o.All,
+		Compatibility:     o.Compatibility,
+		ProjectOptionsFns: po,
+		LoadListeners:     []api.LoadListener{metricsListener},
+		OCI: api.OCIOptions{
+			InsecureRegistries: o.insecureRegistries,
+		},
+	}
+
+	project, err := backend.LoadProject(ctx, loadOpts)
 	if err != nil {
 		return nil, metrics, err
 	}
 
-	if project.Name == "" {
-		return nil, metrics, errors.New("project name can't be empty. Use `--project-name` to set a valid name")
-	}
-
-	project, err = project.WithServicesEnabled(services...)
-	if err != nil {
-		return nil, metrics, err
-	}
-
-	for name, s := range project.Services {
-		s.CustomLabels = map[string]string{
-			api.ProjectLabel:     project.Name,
-			api.ServiceLabel:     name,
-			api.VersionLabel:     api.ComposeVersion,
-			api.WorkingDirLabel:  project.WorkingDir,
-			api.ConfigFilesLabel: strings.Join(project.ComposeFiles, ","),
-			api.OneoffLabel:      "False", // default, will be overridden by `run` command
-		}
-		if len(o.EnvFiles) != 0 {
-			s.CustomLabels[api.EnvironmentFileLabel] = strings.Join(o.EnvFiles, ",")
-		}
-		project.Services[name] = s
-	}
-
-	project, err = project.WithSelectedServices(services)
-	if err != nil {
-		return nil, tracing.Metrics{}, err
-	}
-
-	if !o.All {
-		project = project.WithoutUnnecessaryResources()
-	}
-	return project, metrics, err
+	return project, metrics, nil
 }
 
 func (o *ProjectOptions) remoteLoaders(dockerCli command.Cli) []loader.ResourceLoader {
@@ -368,7 +365,7 @@ func (o *ProjectOptions) remoteLoaders(dockerCli command.Cli) []loader.ResourceL
 		return nil
 	}
 	git := remote.NewGitRemoteLoader(dockerCli, o.Offline)
-	oci := remote.NewOCIRemoteLoader(dockerCli, o.Offline)
+	oci := remote.NewOCIRemoteLoader(dockerCli, o.Offline, api.OCIOptions{})
 	return []loader.ResourceLoader{git, oci}
 }
 
@@ -397,8 +394,8 @@ func (o *ProjectOptions) toProjectOptions(po ...cli.ProjectOptionsFn) (*cli.Proj
 		// if none was selected, get default compose.yaml file from current dir or parent folder
 		cli.WithDefaultConfigPath,
 		// .. and then, a project directory != PWD maybe has been set so let's load .env file
-		cli.WithEnvFiles(o.EnvFiles...),
-		cli.WithDotEnv,
+		cli.WithEnvFiles(o.EnvFiles...), //nolint:gocritic // intentionally applying cli.WithEnvFiles twice.
+		cli.WithDotEnv,                  //nolint:gocritic // intentionally applying cli.WithDotEnv twice.
 		// eventually COMPOSE_PROFILES should have been set
 		cli.WithDefaultProfiles(o.Profiles...),
 		cli.WithName(o.ProjectName),
@@ -412,21 +409,19 @@ const PluginName = "compose"
 
 // RunningAsStandalone detects when running as a standalone program
 func RunningAsStandalone() bool {
-	return len(os.Args) < 2 || os.Args[1] != metadata.MetadataSubcommandName && os.Args[1] != PluginName
+	return len(os.Args) < 2 || os.Args[1] != metadata.MetadataSubcommandName && os.Args[1] != metadata.HookSubcommandName && os.Args[1] != PluginName
+}
+
+type BackendOptions struct {
+	Options []compose.Option
+}
+
+func (o *BackendOptions) Add(option compose.Option) {
+	o.Options = append(o.Options, option)
 }
 
 // RootCommand returns the compose command with its child commands
-func RootCommand(dockerCli command.Cli, backend api.Service) *cobra.Command { //nolint:gocyclo
-	// filter out useless commandConn.CloseWrite warning message that can occur
-	// when using a remote context that is unreachable: "commandConn.CloseWrite: commandconn: failed to wait: signal: killed"
-	// https://github.com/docker/cli/blob/e1f24d3c93df6752d3c27c8d61d18260f141310c/cli/connhelper/commandconn/commandconn.go#L203-L215
-	logrus.AddHook(logutil.NewFilter([]logrus.Level{
-		logrus.WarnLevel,
-	},
-		"commandConn.CloseWrite:",
-		"commandConn.CloseRead:",
-	))
-
+func RootCommand(dockerCli command.Cli, backendOptions *BackendOptions) *cobra.Command { //nolint:gocyclo
 	opts := ProjectOptions{}
 	var (
 		ansi     string
@@ -456,9 +451,7 @@ func RootCommand(dockerCli command.Cli, backend api.Service) *cobra.Command { //
 			}
 		},
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-			ctx := cmd.Context()
 			parent := cmd.Root()
-
 			if parent != nil {
 				parentPrerun := parent.PersistentPreRunE
 				if parentPrerun != nil {
@@ -473,7 +466,7 @@ func RootCommand(dockerCli command.Cli, backend api.Service) *cobra.Command { //
 				logrus.SetLevel(logrus.TraceLevel)
 			}
 
-			err := setEnvWithDotEnv(opts)
+			err := setEnvWithDotEnv(opts, dockerCli)
 			if err != nil {
 				return err
 			}
@@ -490,40 +483,54 @@ func RootCommand(dockerCli command.Cli, backend api.Service) *cobra.Command { //
 			formatter.SetANSIMode(dockerCli, ansi)
 
 			if noColor, ok := os.LookupEnv("NO_COLOR"); ok && noColor != "" {
-				ui.NoColor()
+				display.NoColor()
 				formatter.SetANSIMode(dockerCli, formatter.Never)
 			}
 
 			switch ansi {
 			case "never":
-				ui.Mode = ui.ModePlain
+				display.Mode = display.ModePlain
 			case "always":
-				ui.Mode = ui.ModeTTY
+				display.Mode = display.ModeTTY
 			}
 
+			detached, _ := cmd.Flags().GetBool("detach")
+			var ep api.EventProcessor
 			switch opts.Progress {
-			case "", ui.ModeAuto:
-				if ansi == "never" {
-					ui.Mode = ui.ModePlain
+			case "", display.ModeAuto:
+				switch {
+				case ansi == "never":
+					display.Mode = display.ModePlain
+					ep = display.Plain(dockerCli.Err())
+				case dockerCli.Out().IsTerminal():
+					ep = display.Full(dockerCli.Err(), stdinfo(dockerCli), detached)
+				default:
+					ep = display.Plain(dockerCli.Err())
 				}
-			case ui.ModeTTY:
+			case display.ModeTTY:
 				if ansi == "never" {
 					return fmt.Errorf("can't use --progress tty while ANSI support is disabled")
 				}
-				ui.Mode = ui.ModeTTY
-			case ui.ModePlain:
+				display.Mode = display.ModeTTY
+				ep = display.Full(dockerCli.Err(), stdinfo(dockerCli), detached)
+
+			case display.ModePlain:
 				if ansi == "always" {
 					return fmt.Errorf("can't use --progress plain while ANSI support is forced")
 				}
-				ui.Mode = ui.ModePlain
-			case ui.ModeQuiet, "none":
-				ui.Mode = ui.ModeQuiet
-			case ui.ModeJSON:
-				ui.Mode = ui.ModeJSON
+				display.Mode = display.ModePlain
+				ep = display.Plain(dockerCli.Err())
+			case display.ModeQuiet, "none":
+				display.Mode = display.ModeQuiet
+				ep = display.Quiet()
+			case display.ModeJSON:
+				display.Mode = display.ModeJSON
 				logrus.SetFormatter(&logrus.JSONFormatter{})
+				ep = display.JSON(dockerCli.Err())
 			default:
 				return fmt.Errorf("unsupported --progress value %q", opts.Progress)
 			}
+			backendOptions.Add(compose.WithEventProcessor(ep))
 
 			// (4) options validation / normalization
 			if opts.WorkDir != "" {
@@ -534,11 +541,14 @@ func RootCommand(dockerCli command.Cli, backend api.Service) *cobra.Command { //
 				fmt.Fprint(os.Stderr, aec.Apply("option '--workdir' is DEPRECATED at root level! Please use '--project-directory' instead.\n", aec.RedF))
 			}
 			for i, file := range opts.EnvFiles {
+				file = composepaths.ExpandUser(file)
 				if !filepath.IsAbs(file) {
 					file, err := filepath.Abs(file)
 					if err != nil {
 						return err
 					}
+					opts.EnvFiles[i] = file
+				} else {
 					opts.EnvFiles[i] = file
 				}
 			}
@@ -560,64 +570,61 @@ func RootCommand(dockerCli command.Cli, backend api.Service) *cobra.Command { //
 			}
 			if parallel > 0 {
 				logrus.Debugf("Limiting max concurrency to %d jobs", parallel)
-				backend.MaxConcurrency(parallel)
+				backendOptions.Add(compose.WithMaxConcurrency(parallel))
 			}
 
 			// dry run detection
-			ctx, err = backend.DryRunMode(ctx, dryRun)
-			if err != nil {
-				return err
+			if dryRun {
+				backendOptions.Add(compose.WithDryRun)
 			}
-			cmd.SetContext(ctx)
-
 			return nil
 		},
 	}
 
 	c.AddCommand(
-		upCommand(&opts, dockerCli, backend),
-		downCommand(&opts, dockerCli, backend),
-		startCommand(&opts, dockerCli, backend),
-		restartCommand(&opts, dockerCli, backend),
-		stopCommand(&opts, dockerCli, backend),
-		psCommand(&opts, dockerCli, backend),
-		listCommand(dockerCli, backend),
-		logsCommand(&opts, dockerCli, backend),
+		upCommand(&opts, dockerCli, backendOptions),
+		downCommand(&opts, dockerCli, backendOptions),
+		startCommand(&opts, dockerCli, backendOptions),
+		restartCommand(&opts, dockerCli, backendOptions),
+		stopCommand(&opts, dockerCli, backendOptions),
+		psCommand(&opts, dockerCli, backendOptions),
+		listCommand(dockerCli, backendOptions),
+		logsCommand(&opts, dockerCli, backendOptions),
 		configCommand(&opts, dockerCli),
-		killCommand(&opts, dockerCli, backend),
-		runCommand(&opts, dockerCli, backend),
-		removeCommand(&opts, dockerCli, backend),
-		execCommand(&opts, dockerCli, backend),
-		attachCommand(&opts, dockerCli, backend),
-		exportCommand(&opts, dockerCli, backend),
-		commitCommand(&opts, dockerCli, backend),
-		pauseCommand(&opts, dockerCli, backend),
-		unpauseCommand(&opts, dockerCli, backend),
-		topCommand(&opts, dockerCli, backend),
-		eventsCommand(&opts, dockerCli, backend),
-		portCommand(&opts, dockerCli, backend),
-		imagesCommand(&opts, dockerCli, backend),
+		killCommand(&opts, dockerCli, backendOptions),
+		runCommand(&opts, dockerCli, backendOptions),
+		removeCommand(&opts, dockerCli, backendOptions),
+		execCommand(&opts, dockerCli, backendOptions),
+		attachCommand(&opts, dockerCli, backendOptions),
+		exportCommand(&opts, dockerCli, backendOptions),
+		commitCommand(&opts, dockerCli, backendOptions),
+		pauseCommand(&opts, dockerCli, backendOptions),
+		unpauseCommand(&opts, dockerCli, backendOptions),
+		topCommand(&opts, dockerCli, backendOptions),
+		eventsCommand(&opts, dockerCli, backendOptions),
+		portCommand(&opts, dockerCli, backendOptions),
+		imagesCommand(&opts, dockerCli, backendOptions),
 		versionCommand(dockerCli),
-		buildCommand(&opts, dockerCli, backend),
-		pushCommand(&opts, dockerCli, backend),
-		pullCommand(&opts, dockerCli, backend),
-		createCommand(&opts, dockerCli, backend),
-		copyCommand(&opts, dockerCli, backend),
-		waitCommand(&opts, dockerCli, backend),
-		scaleCommand(&opts, dockerCli, backend),
+		buildCommand(&opts, dockerCli, backendOptions),
+		pushCommand(&opts, dockerCli, backendOptions),
+		pullCommand(&opts, dockerCli, backendOptions),
+		createCommand(&opts, dockerCli, backendOptions),
+		copyCommand(&opts, dockerCli, backendOptions),
+		waitCommand(&opts, dockerCli, backendOptions),
+		scaleCommand(&opts, dockerCli, backendOptions),
 		statsCommand(&opts, dockerCli),
-		watchCommand(&opts, dockerCli, backend),
-		publishCommand(&opts, dockerCli, backend),
-		alphaCommand(&opts, dockerCli, backend),
+		watchCommand(&opts, dockerCli, backendOptions),
+		publishCommand(&opts, dockerCli, backendOptions),
+		alphaCommand(&opts, dockerCli, backendOptions),
 		bridgeCommand(&opts, dockerCli),
-		volumesCommand(&opts, dockerCli, backend),
+		volumesCommand(&opts, dockerCli, backendOptions),
 	)
 
 	c.Flags().SetInterspersed(false)
 	opts.addProjectFlags(c.Flags())
 	c.RegisterFlagCompletionFunc( //nolint:errcheck
 		"project-name",
-		completeProjectNames(backend),
+		completeProjectNames(dockerCli, backendOptions),
 	)
 	c.RegisterFlagCompletionFunc( //nolint:errcheck
 		"project-directory",
@@ -652,7 +659,28 @@ func RootCommand(dockerCli command.Cli, backend api.Service) *cobra.Command { //
 	return c
 }
 
-func setEnvWithDotEnv(opts ProjectOptions) error {
+func stdinfo(dockerCli command.Cli) io.Writer {
+	if stdioToStdout {
+		return dockerCli.Out()
+	}
+	return dockerCli.Err()
+}
+
+func setEnvWithDotEnv(opts ProjectOptions, dockerCli command.Cli) error {
+	// Check if we're using a remote config (OCI or Git)
+	// If so, skip env loading as remote loaders haven't been initialized yet
+	// and trying to process the path would fail
+	remoteLoaders := opts.remoteLoaders(dockerCli)
+	for _, path := range opts.ConfigPaths {
+		for _, loader := range remoteLoaders {
+			if loader.Accept(path) {
+				// Remote config - skip env loading for now
+				// It will be loaded later when the project is fully initialized
+				return nil
+			}
+		}
+	}
+
 	options, err := cli.NewProjectOptions(opts.ConfigPaths,
 		cli.WithWorkingDirectory(opts.ProjectDir),
 		cli.WithOsEnv,
@@ -660,26 +688,26 @@ func setEnvWithDotEnv(opts ProjectOptions) error {
 		cli.WithDotEnv,
 	)
 	if err != nil {
-		return nil
+		return err
 	}
 	envFromFile, err := dotenv.GetEnvFromFile(composegoutils.GetAsEqualsMap(os.Environ()), options.EnvFiles)
 	if err != nil {
-		return nil
+		return err
 	}
 	for k, v := range envFromFile {
 		if _, ok := os.LookupEnv(k); !ok && strings.HasPrefix(k, "COMPOSE_") {
-			if err = os.Setenv(k, v); err != nil {
-				return nil
+			if err := os.Setenv(k, v); err != nil {
+				return err
 			}
 		}
 	}
-	return err
+	return nil
 }
 
 var printerModes = []string{
-	ui.ModeAuto,
-	ui.ModeTTY,
-	ui.ModePlain,
-	ui.ModeJSON,
-	ui.ModeQuiet,
+	display.ModeAuto,
+	display.ModeTTY,
+	display.ModePlain,
+	display.ModeJSON,
+	display.ModeQuiet,
 }

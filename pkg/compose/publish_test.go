@@ -17,19 +17,23 @@
 package compose
 
 import (
-	"context"
+	"errors"
 	"os"
+	"slices"
 	"testing"
 
 	"github.com/compose-spec/compose-go/v2/loader"
 	"github.com/compose-spec/compose-go/v2/types"
-	"github.com/docker/compose/v2/pkg/api"
+	"github.com/google/go-cmp/cmp"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"gotest.tools/v3/assert"
+
+	"github.com/docker/compose/v5/internal"
+	"github.com/docker/compose/v5/pkg/api"
 )
 
-func Test_processExtends(t *testing.T) {
-	project, err := loader.LoadWithContext(context.TODO(), types.ConfigDetails{
+func Test_createLayers(t *testing.T) {
+	project, err := loader.LoadWithContext(t.Context(), types.ConfigDetails{
 		WorkingDir:  "testdata/publish/",
 		Environment: types.Mapping{},
 		ConfigFiles: []types.ConfigFile{
@@ -39,35 +43,123 @@ func Test_processExtends(t *testing.T) {
 		},
 	})
 	assert.NilError(t, err)
-	extFiles := map[string]string{}
-	file, err := processFile(context.TODO(), "testdata/publish/compose.yaml", project, extFiles)
+	project.ComposeFiles = []string{"testdata/publish/compose.yaml"}
+
+	service := &composeService{}
+	layers, err := service.createLayers(t.Context(), project, api.PublishOptions{
+		WithEnvironment: true,
+	})
 	assert.NilError(t, err)
 
-	v := string(file)
-	assert.Equal(t, v, `name: test
+	published := string(layers[0].Data)
+	assert.Equal(t, published, `name: test
 services:
   test:
     extends:
       file: f8f9ede3d201ec37d5a5e3a77bbadab79af26035e53135e19571f50d541d390c.yaml
       service: foo
+
+  string:
+    image: test
+    env_file: 5efca9cdbac9f5394c6c2e2094b1b42661f988f57fcab165a0bf72b205451af3.env
+
+  list:
+    image: test
+    env_file:
+      - 5efca9cdbac9f5394c6c2e2094b1b42661f988f57fcab165a0bf72b205451af3.env
+
+  mapping:
+    image: test
+    env_file:
+      - path: 5efca9cdbac9f5394c6c2e2094b1b42661f988f57fcab165a0bf72b205451af3.env
 `)
 
-	layers, err := processExtends(context.TODO(), project, extFiles)
-	assert.NilError(t, err)
-
-	b, err := os.ReadFile("testdata/publish/common.yaml")
-	assert.NilError(t, err)
-	assert.DeepEqual(t, []v1.Descriptor{
+	expectedLayers := []v1.Descriptor{
 		{
 			MediaType: "application/vnd.docker.compose.file+yaml",
-			Digest:    "sha256:d3ba84507b56ec783f4b6d24306b99a15285f0a23a835f0b668c2dbf9c59c241",
-			Size:      32,
+			Annotations: map[string]string{
+				"com.docker.compose.file":    "compose.yaml",
+				"com.docker.compose.version": internal.Version,
+			},
+		},
+		{
+			MediaType: "application/vnd.docker.compose.file+yaml",
 			Annotations: map[string]string{
 				"com.docker.compose.extends": "true",
-				"com.docker.compose.file":    "f8f9ede3d201ec37d5a5e3a77bbadab79af26035e53135e19571f50d541d390c.yaml",
-				"com.docker.compose.version": api.ComposeVersion,
+				"com.docker.compose.file":    "f8f9ede3d201ec37d5a5e3a77bbadab79af26035e53135e19571f50d541d390c",
+				"com.docker.compose.version": internal.Version,
 			},
-			Data: b,
 		},
-	}, layers)
+		{
+			MediaType: "application/vnd.docker.compose.envfile",
+			Annotations: map[string]string{
+				"com.docker.compose.envfile": "5efca9cdbac9f5394c6c2e2094b1b42661f988f57fcab165a0bf72b205451af3",
+				"com.docker.compose.version": internal.Version,
+			},
+		},
+	}
+	assert.DeepEqual(t, expectedLayers, layers, cmp.FilterPath(func(path cmp.Path) bool {
+		return !slices.Contains([]string{".Data", ".Digest", ".Size"}, path.String())
+	}, cmp.Ignore()))
+}
+
+func Test_preChecks_sensitive_data_detected_decline(t *testing.T) {
+	dir := t.TempDir()
+	envPath := dir + "/secrets.env"
+	secretData := `AWS_SECRET_ACCESS_KEY="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"`
+	err := os.WriteFile(envPath, []byte(secretData), 0o600)
+	assert.NilError(t, err)
+
+	project := &types.Project{
+		Services: types.Services{
+			"web": {
+				Name:  "web",
+				Image: "nginx",
+				EnvFiles: []types.EnvFile{
+					{Path: envPath, Required: true},
+				},
+			},
+		},
+	}
+
+	declined := func(message string, defaultValue bool) (bool, error) {
+		return false, nil
+	}
+	svc := &composeService{
+		prompt: declined,
+	}
+
+	accept, err := svc.preChecks(t.Context(), project, api.PublishOptions{})
+	assert.NilError(t, err)
+	assert.Equal(t, accept, false)
+}
+
+func Test_publish_decline_returns_ErrCanceled(t *testing.T) {
+	project := &types.Project{
+		Services: types.Services{
+			"web": {
+				Name:  "web",
+				Image: "nginx",
+				Volumes: []types.ServiceVolumeConfig{
+					{
+						Type:   types.VolumeTypeBind,
+						Source: "/host/path",
+						Target: "/container/path",
+					},
+				},
+			},
+		},
+	}
+
+	declined := func(message string, defaultValue bool) (bool, error) {
+		return false, nil
+	}
+	svc := &composeService{
+		prompt: declined,
+		events: &ignore{},
+	}
+
+	err := svc.publish(t.Context(), project, "docker.io/myorg/myapp:latest", api.PublishOptions{})
+	assert.Assert(t, errors.Is(err, api.ErrCanceled),
+		"expected api.ErrCanceled when user declines, got: %v", err)
 }

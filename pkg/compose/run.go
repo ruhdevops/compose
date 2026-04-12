@@ -27,30 +27,60 @@ import (
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/docker/cli/cli"
 	cmd "github.com/docker/cli/cli/command/container"
-	"github.com/docker/compose/v2/pkg/api"
-	"github.com/docker/compose/v2/pkg/progress"
-	"github.com/docker/docker/pkg/stringid"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/events"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/client/pkg/stringid"
+
+	"github.com/docker/compose/v5/pkg/api"
 )
 
+type prepareRunResult struct {
+	containerID string
+	service     types.ServiceConfig
+	created     container.Summary
+}
+
 func (s *composeService) RunOneOffContainer(ctx context.Context, project *types.Project, opts api.RunOptions) (int, error) {
-	containerID, err := s.prepareRun(ctx, project, opts)
+	result, err := s.prepareRun(ctx, project, opts)
 	if err != nil {
 		return 0, err
 	}
 
-	// remove cancellable context signal handler so we can forward signals to container without compose to exit
+	// remove cancellable context signal handler so we can forward signals to container without compose from exiting
 	signal.Reset()
 
 	sigc := make(chan os.Signal, 128)
 	signal.Notify(sigc)
-	go cmd.ForwardAllSignals(ctx, s.apiClient(), containerID, sigc)
+	go cmd.ForwardAllSignals(ctx, s.apiClient(), result.containerID, sigc)
 	defer signal.Stop(sigc)
+
+	// If the service has post_start hooks, set up a goroutine that waits for
+	// the container to start and then executes them. This is needed because
+	// cmd.RunStart both starts and attaches to the container in one call,
+	// so we can't run hooks sequentially between start and attach.
+	var hookErrCh chan error
+	if len(result.service.PostStart) > 0 {
+		hookErrCh = make(chan error, 1)
+		go func() {
+			hookErrCh <- s.runPostStartHooksOnEvent(ctx, result.containerID, result.service, result.created)
+		}()
+	}
 
 	err = cmd.RunStart(ctx, s.dockerCli, &cmd.StartOptions{
 		OpenStdin:  !opts.Detach && opts.Interactive,
 		Attach:     !opts.Detach,
-		Containers: []string{containerID},
+		Containers: []string{result.containerID},
+		DetachKeys: s.configFile().DetachKeys,
 	})
+
+	// Wait for hooks to complete if they were started
+	if hookErrCh != nil {
+		if hookErr := <-hookErrCh; hookErr != nil && err == nil {
+			err = hookErr
+		}
+	}
+
 	var stErr cli.StatusError
 	if errors.As(err, &stErr) {
 		return stErr.StatusCode, nil
@@ -58,29 +88,60 @@ func (s *composeService) RunOneOffContainer(ctx context.Context, project *types.
 	return 0, err
 }
 
-func (s *composeService) prepareRun(ctx context.Context, project *types.Project, opts api.RunOptions) (string, error) {
+// runPostStartHooksOnEvent listens for the container's start event and executes
+// post_start lifecycle hooks once the container is running.
+func (s *composeService) runPostStartHooksOnEvent(ctx context.Context, containerID string, service types.ServiceConfig, ctr container.Summary) error {
+	evtCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	res := s.apiClient().Events(evtCtx, client.EventsListOptions{
+		Filters: make(client.Filters).
+			Add("type", "container").
+			Add("container", containerID).
+			Add("event", string(events.ActionStart)),
+	})
+
+	// Wait for the container start event
+	select {
+	case <-evtCtx.Done():
+		return evtCtx.Err()
+	case err := <-res.Err:
+		return err
+	case <-res.Messages:
+		// Container started, run hooks
+	}
+
+	for _, hook := range service.PostStart {
+		if err := s.runHook(ctx, ctr, service, hook, nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *composeService) prepareRun(ctx context.Context, project *types.Project, opts api.RunOptions) (prepareRunResult, error) {
 	// Temporary implementation of use_api_socket until we get actual support inside docker engine
 	project, err := s.useAPISocket(project)
 	if err != nil {
-		return "", err
+		return prepareRunResult{}, err
 	}
 
-	err = progress.Run(ctx, func(ctx context.Context) error {
+	err = Run(ctx, func(ctx context.Context) error {
 		return s.startDependencies(ctx, project, opts)
-	}, s.stdinfo())
+	}, "run", s.events)
 	if err != nil {
-		return "", err
+		return prepareRunResult{}, err
 	}
 
 	service, err := project.GetService(opts.Service)
 	if err != nil {
-		return "", err
+		return prepareRunResult{}, err
 	}
 
 	applyRunOptions(project, &service, opts)
 
 	if err := s.stdin().CheckTty(opts.Interactive, service.Tty); err != nil {
-		return "", err
+		return prepareRunResult{}, err
 	}
 
 	slug := stringid.GenerateRandomID()
@@ -97,18 +158,20 @@ func (s *composeService) prepareRun(ctx context.Context, project *types.Project,
 		Add(api.SlugLabel, slug).
 		Add(api.OneoffLabel, "True")
 
-	if err := s.ensureImagesExists(ctx, project, opts.Build, opts.QuietPull); err != nil { // all dependencies already checked, but might miss service img
-		return "", err
+	// Only ensure image exists for the target service, dependencies were already handled by startDependencies
+	buildOpts := prepareBuildOptions(opts)
+	if err := s.ensureImagesExists(ctx, project, buildOpts, opts.QuietPull); err != nil { // all dependencies already checked, but might miss service img
+		return prepareRunResult{}, err
 	}
 
 	observedState, err := s.getContainers(ctx, project.Name, oneOffInclude, true)
 	if err != nil {
-		return "", err
+		return prepareRunResult{}, err
 	}
 
 	if !opts.NoDeps {
 		if err := s.waitDependencies(ctx, project, service.Name, service.DependsOn, observedState, 0); err != nil {
-			return "", err
+			return prepareRunResult{}, err
 		}
 	}
 	createOpts := createOptions{
@@ -120,31 +183,45 @@ func (s *composeService) prepareRun(ctx context.Context, project *types.Project,
 
 	err = newConvergence(project.ServiceNames(), observedState, nil, nil, s).resolveServiceReferences(&service)
 	if err != nil {
-		return "", err
+		return prepareRunResult{}, err
 	}
 
 	err = s.ensureModels(ctx, project, opts.QuietPull)
 	if err != nil {
-		return "", err
+		return prepareRunResult{}, err
 	}
 
 	created, err := s.createContainer(ctx, project, service, service.ContainerName, -1, createOpts)
 	if err != nil {
-		return "", err
+		return prepareRunResult{}, err
 	}
 
-	ctr, err := s.apiClient().ContainerInspect(ctx, created.ID)
+	inspect, err := s.apiClient().ContainerInspect(ctx, created.ID, client.ContainerInspectOptions{})
 	if err != nil {
-		return "", err
+		return prepareRunResult{}, err
 	}
 
-	err = s.injectSecrets(ctx, project, service, ctr.ID)
+	err = s.injectSecrets(ctx, project, service, inspect.Container.ID)
 	if err != nil {
-		return created.ID, err
+		return prepareRunResult{containerID: created.ID}, err
 	}
 
-	err = s.injectConfigs(ctx, project, service, ctr.ID)
-	return created.ID, err
+	err = s.injectConfigs(ctx, project, service, inspect.Container.ID)
+	return prepareRunResult{
+		containerID: created.ID,
+		service:     service,
+		created:     created,
+	}, err
+}
+
+func prepareBuildOptions(opts api.RunOptions) *api.BuildOptions {
+	if opts.Build == nil {
+		return nil
+	}
+	// Create a copy of build options and restrict to only the target service
+	buildOptsCopy := *opts.Build
+	buildOptsCopy.Services = []string{opts.Service}
+	return &buildOptsCopy
 }
 
 func applyRunOptions(project *types.Project, service *types.ServiceConfig, opts api.RunOptions) {

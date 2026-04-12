@@ -21,8 +21,10 @@ import (
 	"strings"
 
 	"github.com/docker/cli/cli/command"
-	"github.com/docker/compose/v2/pkg/api"
 	"github.com/spf13/cobra"
+
+	"github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/compose"
 )
 
 // validArgsFn defines a completion func to be returned to fetch completion options
@@ -37,7 +39,12 @@ func noCompletion() validArgsFn {
 func completeServiceNames(dockerCli command.Cli, p *ProjectOptions) validArgsFn {
 	return func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		p.Offline = true
-		project, _, err := p.ToProject(cmd.Context(), dockerCli, nil)
+		backend, err := compose.NewComposeService(dockerCli)
+		if err != nil {
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		}
+
+		project, _, err := p.ToProject(cmd.Context(), dockerCli, backend, nil)
 		if err != nil {
 			return nil, cobra.ShellCompDirectiveNoFileComp
 		}
@@ -52,8 +59,13 @@ func completeServiceNames(dockerCli command.Cli, p *ProjectOptions) validArgsFn 
 	}
 }
 
-func completeProjectNames(backend api.Service) func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+func completeProjectNames(dockerCli command.Cli, backendOptions *BackendOptions) func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 	return func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+		backend, err := compose.NewComposeService(dockerCli, backendOptions.Options...)
+		if err != nil {
+			return nil, cobra.ShellCompDirectiveError
+		}
+
 		list, err := backend.List(cmd.Context(), api.ListOptions{
 			All: true,
 		})
@@ -73,7 +85,12 @@ func completeProjectNames(backend api.Service) func(cmd *cobra.Command, args []s
 func completeProfileNames(dockerCli command.Cli, p *ProjectOptions) validArgsFn {
 	return func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 		p.Offline = true
-		project, _, err := p.ToProject(cmd.Context(), dockerCli, nil)
+		backend, err := compose.NewComposeService(dockerCli)
+		if err != nil {
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		}
+
+		project, _, err := p.ToProject(cmd.Context(), dockerCli, backend, nil)
 		if err != nil {
 			return nil, cobra.ShellCompDirectiveNoFileComp
 		}

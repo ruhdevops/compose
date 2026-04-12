@@ -1,5 +1,4 @@
-//go:build darwin
-// +build darwin
+//go:build fsnotify
 
 /*
    Copyright 2020 Docker Compose CLI authors
@@ -23,10 +22,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
-	pathutil "github.com/docker/compose/v2/internal/paths"
 	"github.com/fsnotify/fsevents"
+
+	pathutil "github.com/docker/compose/v5/internal/paths"
 )
 
 // A file watcher optimized for Darwin.
@@ -37,7 +38,8 @@ type fseventNotify struct {
 	errors chan error
 	stop   chan struct{}
 
-	pathsWereWatching map[string]interface{}
+	pathsWereWatching map[string]any
+	closeOnce         sync.Once
 }
 
 func (d *fseventNotify) loop() {
@@ -71,7 +73,7 @@ func (d *fseventNotify) initAdd(name string) {
 	d.stream.Paths = append(d.stream.Paths, name)
 
 	if d.pathsWereWatching == nil {
-		d.pathsWereWatching = make(map[string]interface{})
+		d.pathsWereWatching = make(map[string]any)
 	}
 	d.pathsWereWatching[name] = struct{}{}
 }
@@ -80,6 +82,8 @@ func (d *fseventNotify) Start() error {
 	if len(d.stream.Paths) == 0 {
 		return nil
 	}
+
+	d.closeOnce = sync.Once{}
 
 	numberOfWatches.Add(int64(len(d.stream.Paths)))
 
@@ -92,11 +96,13 @@ func (d *fseventNotify) Start() error {
 }
 
 func (d *fseventNotify) Close() error {
-	numberOfWatches.Add(int64(-len(d.stream.Paths)))
+	d.closeOnce.Do(func() {
+		numberOfWatches.Add(int64(-len(d.stream.Paths)))
 
-	d.stream.Stop()
-	close(d.errors)
-	close(d.stop)
+		d.stream.Stop()
+		close(d.errors)
+		close(d.stop)
+	})
 
 	return nil
 }

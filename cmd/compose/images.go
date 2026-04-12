@@ -27,12 +27,13 @@ import (
 
 	"github.com/containerd/platforms"
 	"github.com/docker/cli/cli/command"
-	"github.com/docker/docker/pkg/stringid"
 	"github.com/docker/go-units"
+	"github.com/moby/moby/client/pkg/stringid"
 	"github.com/spf13/cobra"
 
-	"github.com/docker/compose/v2/cmd/formatter"
-	"github.com/docker/compose/v2/pkg/api"
+	"github.com/docker/compose/v5/cmd/formatter"
+	"github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/compose"
 )
 
 type imageOptions struct {
@@ -41,7 +42,7 @@ type imageOptions struct {
 	Format string
 }
 
-func imagesCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service) *cobra.Command {
+func imagesCommand(p *ProjectOptions, dockerCli command.Cli, backendOptions *BackendOptions) *cobra.Command {
 	opts := imageOptions{
 		ProjectOptions: p,
 	}
@@ -49,7 +50,7 @@ func imagesCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service
 		Use:   "images [OPTIONS] [SERVICE...]",
 		Short: "List images used by the created containers",
 		RunE: Adapt(func(ctx context.Context, args []string) error {
-			return runImages(ctx, dockerCli, backend, opts, args)
+			return runImages(ctx, dockerCli, backendOptions, opts, args)
 		}),
 		ValidArgsFunction: completeServiceNames(dockerCli, p),
 	}
@@ -58,12 +59,16 @@ func imagesCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service
 	return imgCmd
 }
 
-func runImages(ctx context.Context, dockerCli command.Cli, backend api.Service, opts imageOptions, services []string) error {
+func runImages(ctx context.Context, dockerCli command.Cli, backendOptions *BackendOptions, opts imageOptions, services []string) error {
 	projectName, err := opts.toProjectName(ctx, dockerCli)
 	if err != nil {
 		return err
 	}
 
+	backend, err := compose.NewComposeService(dockerCli, backendOptions.Options...)
+	if err != nil {
+		return err
+	}
 	images, err := backend.Images(ctx, projectName, api.ImagesOptions{
 		Services: services,
 	})
@@ -90,21 +95,19 @@ func runImages(ctx context.Context, dockerCli command.Cli, backend api.Service, 
 	if opts.Format == "json" {
 
 		type img struct {
-			ID            string    `json:"ID"`
-			ContainerName string    `json:"ContainerName"`
-			Repository    string    `json:"Repository"`
-			Tag           string    `json:"Tag"`
-			Platform      string    `json:"Platform"`
-			Size          int64     `json:"Size"`
-			LastTagTime   time.Time `json:"LastTagTime"`
+			ID            string     `json:"ID"`
+			ContainerName string     `json:"ContainerName"`
+			Repository    string     `json:"Repository"`
+			Tag           string     `json:"Tag"`
+			Platform      string     `json:"Platform"`
+			Size          int64      `json:"Size"`
+			Created       *time.Time `json:"Created,omitempty"`
+			LastTagTime   time.Time  `json:"LastTagTime,omitzero"`
 		}
 		// Convert map to slice
 		var imageList []img
 		for ctr, i := range images {
 			lastTagTime := i.LastTagTime
-			if lastTagTime.IsZero() {
-				lastTagTime = i.Created
-			}
 			imageList = append(imageList, img{
 				ContainerName: ctr,
 				ID:            i.ID,
@@ -112,6 +115,7 @@ func runImages(ctx context.Context, dockerCli command.Cli, backend api.Service, 
 				Tag:           i.Tag,
 				Platform:      platforms.Format(i.Platform),
 				Size:          i.Size,
+				Created:       i.Created,
 				LastTagTime:   lastTagTime,
 			})
 		}
@@ -137,7 +141,10 @@ func runImages(ctx context.Context, dockerCli command.Cli, backend api.Service, 
 				if tag == "" {
 					tag = "<none>"
 				}
-				created := units.HumanDuration(time.Now().UTC().Sub(img.LastTagTime)) + " ago"
+				created := "N/A"
+				if img.Created != nil {
+					created = units.HumanDuration(time.Now().UTC().Sub(*img.Created)) + " ago"
+				}
 				_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 					container, repo, tag, platforms.Format(img.Platform), id, size, created)
 			}

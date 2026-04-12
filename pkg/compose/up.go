@@ -30,17 +30,19 @@ import (
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/containerd/errdefs"
 	"github.com/docker/cli/cli"
-	"github.com/docker/compose/v2/cmd/formatter"
-	"github.com/docker/compose/v2/internal/tracing"
-	"github.com/docker/compose/v2/pkg/api"
-	"github.com/docker/compose/v2/pkg/progress"
 	"github.com/eiannone/keyboard"
+	"github.com/moby/moby/client"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/docker/compose/v5/cmd/formatter"
+	"github.com/docker/compose/v5/internal/desktop"
+	"github.com/docker/compose/v5/internal/tracing"
+	"github.com/docker/compose/v5/pkg/api"
 )
 
 func (s *composeService) Up(ctx context.Context, project *types.Project, options api.UpOptions) error { //nolint:gocyclo
-	err := progress.Run(ctx, tracing.SpanWrapFunc("project/up", tracing.ProjectOptions(ctx, project), func(ctx context.Context) error {
+	err := Run(ctx, tracing.SpanWrapFunc("project/up", tracing.ProjectOptions(ctx, project), func(ctx context.Context) error {
 		err := s.create(ctx, project, options.Create)
 		if err != nil {
 			return err
@@ -49,7 +51,7 @@ func (s *composeService) Up(ctx context.Context, project *types.Project, options
 			return s.start(ctx, project.Name, options.Start, nil)
 		}
 		return nil
-	}), s.stdinfo())
+	}), "up", s.events)
 	if err != nil {
 		return err
 	}
@@ -87,8 +89,9 @@ func (s *composeService) Up(ctx context.Context, project *types.Project, options
 			if err != nil {
 				return err
 			}
-			tracing.KeyboardMetrics(ctx, options.Start.NavigationMenu, isDockerDesktopActive)
-			navigationMenu = formatter.NewKeyboardManager(isDockerDesktopActive, signalChan)
+			isLogsViewEnabled := s.isDesktopFeatureActive(ctx, desktop.FeatureLogsTab)
+			tracing.KeyboardMetrics(ctx, options.Start.NavigationMenu, isDockerDesktopActive, isLogsViewEnabled)
+			navigationMenu = formatter.NewKeyboardManager(isDockerDesktopActive, isLogsViewEnabled, signalChan)
 			logConsumer = navigationMenu.Decorate(logConsumer)
 		}
 	}
@@ -108,6 +111,10 @@ func (s *composeService) Up(ctx context.Context, project *types.Project, options
 	globalCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	if navigationMenu != nil {
+		navigationMenu.EnableDetach(cancel)
+	}
+
 	var (
 		eg   errgroup.Group
 		mu   sync.Mutex
@@ -126,14 +133,12 @@ func (s *composeService) Up(ctx context.Context, project *types.Project, options
 		first := true
 		gracefulTeardown := func() {
 			first = false
-			fmt.Println("Gracefully Stopping... press Ctrl+C again to force")
+			s.events.On(newEvent(api.ResourceCompose, api.Working, api.StatusStopping, "Gracefully Stopping... press Ctrl+C again to force"))
 			eg.Go(func() error {
-				err := progress.RunWithLog(context.WithoutCancel(globalCtx), func(c context.Context) error {
-					return s.stop(c, project.Name, api.StopOptions{
-						Services: options.Create.Services,
-						Project:  project,
-					}, printer.HandleEvent)
-				}, s.stdinfo(), logConsumer)
+				err = s.stop(context.WithoutCancel(globalCtx), project.Name, api.StopOptions{
+					Services: options.Create.Services,
+					Project:  project,
+				}, printer.HandleEvent)
 				appendErr(err)
 				return nil
 			})
@@ -164,7 +169,7 @@ func (s *composeService) Up(ctx context.Context, project *types.Project, options
 						All:      true,
 					})
 					// Ignore errors indicating that some of the containers were already stopped or removed.
-					if errdefs.IsNotFound(err) || errdefs.IsConflict(err) {
+					if errdefs.IsNotFound(err) || errdefs.IsConflict(err) || errors.Is(err, api.ErrNoResources) {
 						return nil
 					}
 
@@ -207,14 +212,12 @@ func (s *composeService) Up(ctx context.Context, project *types.Project, options
 				}
 				once = false
 				exitCode = event.ExitCode
-				_, _ = fmt.Fprintln(s.stdinfo(), progress.ErrorColor("Aborting on container exit..."))
+				s.events.On(newEvent(api.ResourceCompose, api.Working, api.StatusStopping, "Aborting on container exit..."))
 				eg.Go(func() error {
-					err := progress.RunWithLog(context.WithoutCancel(globalCtx), func(c context.Context) error {
-						return s.stop(c, project.Name, api.StopOptions{
-							Services: options.Create.Services,
-							Project:  project,
-						}, printer.HandleEvent)
-					}, s.stdinfo(), logConsumer)
+					err = s.stop(context.WithoutCancel(globalCtx), project.Name, api.StopOptions{
+						Services: options.Create.Services,
+						Project:  project,
+					}, printer.HandleEvent)
 					appendErr(err)
 					return nil
 				})
@@ -245,22 +248,19 @@ func (s *composeService) Up(ctx context.Context, project *types.Project, options
 	}
 
 	monitor.withListener(func(event api.ContainerEvent) {
-		if event.Type != api.ContainerEventStarted {
-			return
-		}
-		if slices.Contains(attached, event.ID) && !event.Restarting {
+		if !shouldFollowStartEvent(event, attached, options.Start.AttachTo) {
 			return
 		}
 		eg.Go(func() error {
-			ctr, err := s.apiClient().ContainerInspect(globalCtx, event.ID)
+			res, err := s.apiClient().ContainerInspect(globalCtx, event.ID, client.ContainerInspectOptions{})
 			if err != nil {
 				appendErr(err)
 				return nil
 			}
 
-			err = s.doLogContainer(globalCtx, options.Start.Attach, event.Source, ctr, api.LogOptions{
+			err = s.doLogContainer(globalCtx, options.Start.Attach, event.Source, res.Container, api.LogOptions{
 				Follow: true,
-				Since:  ctr.State.StartedAt,
+				Since:  res.Container.State.StartedAt,
 			})
 			if errdefs.IsNotImplemented(err) {
 				// container may be configured with logging_driver: none
@@ -300,4 +300,17 @@ func (s *composeService) Up(ctx context.Context, project *types.Project, options
 		return cli.StatusError{StatusCode: exitCode, Status: errMsg}
 	}
 	return err
+}
+
+func shouldFollowStartEvent(event api.ContainerEvent, attached []string, attachTo []string) bool {
+	if event.Type != api.ContainerEventStarted {
+		return false
+	}
+	if len(attachTo) > 0 && !slices.Contains(attachTo, event.Service) {
+		return false
+	}
+	if slices.Contains(attached, event.ID) && !event.Restarting {
+		return false
+	}
+	return true
 }

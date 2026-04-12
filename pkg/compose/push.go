@@ -27,38 +27,36 @@ import (
 
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/distribution/reference"
-	"github.com/docker/buildx/driver"
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/pkg/jsonmessage"
+	"github.com/docker/go-units"
+	"github.com/moby/moby/api/types/jsonstream"
+	"github.com/moby/moby/client"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/docker/compose/v2/internal/registry"
-	"github.com/docker/compose/v2/pkg/api"
-	"github.com/docker/compose/v2/pkg/progress"
+	"github.com/docker/compose/v5/internal/registry"
+	"github.com/docker/compose/v5/pkg/api"
 )
 
 func (s *composeService) Push(ctx context.Context, project *types.Project, options api.PushOptions) error {
 	if options.Quiet {
 		return s.push(ctx, project, options)
 	}
-	return progress.RunWithTitle(ctx, func(ctx context.Context) error {
+	return Run(ctx, func(ctx context.Context) error {
 		return s.push(ctx, project, options)
-	}, s.stdinfo(), "Pushing")
+	}, "push", s.events)
 }
 
 func (s *composeService) push(ctx context.Context, project *types.Project, options api.PushOptions) error {
 	eg, ctx := errgroup.WithContext(ctx)
 	eg.SetLimit(s.maxConcurrency)
 
-	w := progress.ContextWriter(ctx)
 	for _, service := range project.Services {
 		if service.Build == nil || service.Image == "" {
 			if options.ImageMandatory && service.Image == "" && service.Provider == nil {
 				return fmt.Errorf("%q attribute is mandatory to push an image for service %q", "service.image", service.Name)
 			}
-			w.Event(progress.Event{
+			s.events.On(api.Resource{
 				ID:     service.Name,
-				Status: progress.Done,
+				Status: api.Done,
 				Text:   "Skipped",
 			})
 			continue
@@ -70,12 +68,16 @@ func (s *composeService) push(ctx context.Context, project *types.Project, optio
 
 		for _, tag := range tags {
 			eg.Go(func() error {
-				err := s.pushServiceImage(ctx, tag, s.configFile(), w, options.Quiet)
+				s.events.On(newEvent(tag, api.Working, "Pushing"))
+				err := s.pushServiceImage(ctx, tag, options.Quiet)
 				if err != nil {
 					if !options.IgnoreFailures {
+						s.events.On(newEvent(tag, api.Error, err.Error()))
 						return err
 					}
-					w.TailMsgf("Pushing %s: %s", service.Name, err.Error())
+					s.events.On(newEvent(tag, api.Warning, err.Error()))
+				} else {
+					s.events.On(newEvent(tag, api.Done, "Pushed"))
 				}
 				return nil
 			})
@@ -84,13 +86,13 @@ func (s *composeService) push(ctx context.Context, project *types.Project, optio
 	return eg.Wait()
 }
 
-func (s *composeService) pushServiceImage(ctx context.Context, tag string, configFile driver.Auth, w progress.Writer, quietPush bool) error {
+func (s *composeService) pushServiceImage(ctx context.Context, tag string, quietPush bool) error {
 	ref, err := reference.ParseNormalizedNamed(tag)
 	if err != nil {
 		return err
 	}
 
-	authConfig, err := configFile.GetAuthConfig(registry.GetAuthConfigKey(reference.Domain(ref)))
+	authConfig, err := s.configFile().GetAuthConfig(registry.GetAuthConfigKey(reference.Domain(ref)))
 	if err != nil {
 		return err
 	}
@@ -100,7 +102,7 @@ func (s *composeService) pushServiceImage(ctx context.Context, tag string, confi
 		return err
 	}
 
-	stream, err := s.apiClient().ImagePush(ctx, tag, image.PushOptions{
+	stream, err := s.apiClient().ImagePush(ctx, tag, client.ImagePushOptions{
 		RegistryAuth: base64.URLEncoding.EncodeToString(buf),
 	})
 	if err != nil {
@@ -108,7 +110,7 @@ func (s *composeService) pushServiceImage(ctx context.Context, tag string, confi
 	}
 	dec := json.NewDecoder(stream)
 	for {
-		var jm jsonmessage.JSONMessage
+		var jm jsonstream.Message
 		if err := dec.Decode(&jm); err != nil {
 			if errors.Is(err, io.EOF) {
 				break
@@ -120,61 +122,85 @@ func (s *composeService) pushServiceImage(ctx context.Context, tag string, confi
 		}
 
 		if !quietPush {
-			toPushProgressEvent(tag, jm, w)
+			toPushProgressEvent(tag, jm, s.events)
 		}
 	}
 
 	return nil
 }
 
-func toPushProgressEvent(prefix string, jm jsonmessage.JSONMessage, w progress.Writer) {
+func toPushProgressEvent(prefix string, jm jsonstream.Message, events api.EventProcessor) {
 	if jm.ID == "" {
 		// skipped
 		return
 	}
 	var (
 		text    string
-		status  = progress.Working
+		status  = api.Working
 		total   int64
 		current int64
 		percent int
 	)
 	if isDone(jm) {
-		status = progress.Done
+		status = api.Done
 		percent = 100
 	}
 	if jm.Error != nil {
-		status = progress.Error
+		status = api.Error
 		text = jm.Error.Message
 	}
 	if jm.Progress != nil {
-		text = jm.Progress.String()
+		text = progressText(jm.Progress)
 		if jm.Progress.Total != 0 {
 			current = jm.Progress.Current
 			total = jm.Progress.Total
 			if jm.Progress.Total > 0 {
-				percent = int(jm.Progress.Current * 100 / jm.Progress.Total)
+				percent = min(int(jm.Progress.Current*100/jm.Progress.Total), 100)
 			}
 		}
 	}
 
-	w.Event(progress.Event{
-		ID:         fmt.Sprintf("Pushing %s: %s", prefix, jm.ID),
-		Text:       jm.Status,
-		Status:     status,
-		Current:    current,
-		Total:      total,
-		Percent:    percent,
-		StatusText: text,
+	events.On(api.Resource{
+		ParentID: prefix,
+		ID:       jm.ID,
+		Text:     text,
+		Status:   status,
+		Current:  current,
+		Total:    total,
+		Percent:  percent,
 	})
 }
 
-func isDone(msg jsonmessage.JSONMessage) bool {
+func isDone(msg jsonstream.Message) bool {
 	// TODO there should be a better way to detect push is done than such a status message check
 	switch strings.ToLower(msg.Status) {
 	case "pushed", "layer already exists":
 		return true
 	default:
 		return false
+	}
+}
+
+// progressText is a minimal variant of [jsonmessage.JSONProgress.String()]
+//
+// [jsonmessage.JSONProgress.String()]: https://github.com/moby/moby/blob/v28.5.2/pkg/jsonmessage/jsonmessage.go#L54-L117
+func progressText(p *jsonstream.Progress) string {
+	switch {
+	case p.Current <= 0 && p.Total <= 0:
+		return ""
+	case p.Units == "": // no units, use bytes
+		current := units.HumanSize(float64(p.Current))
+		if p.Total <= 0 || p.Total > p.Current {
+			// remove total display if the reported current is wonky.
+			return fmt.Sprintf("%8v", current)
+		}
+		total := units.HumanSize(float64(p.Total))
+		return fmt.Sprintf("%8v/%v", current, total)
+	default:
+		if p.Total <= 0 || p.Total > p.Current {
+			// remove total display if the reported current is wonky.
+			return fmt.Sprintf("%d %s", p.Current, p.Units)
+		}
+		return fmt.Sprintf("%d/%d %s", p.Current, p.Total, p.Units)
 	}
 }

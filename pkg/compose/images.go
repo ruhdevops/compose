@@ -27,20 +27,19 @@ import (
 	"github.com/containerd/errdefs"
 	"github.com/containerd/platforms"
 	"github.com/distribution/reference"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/versions"
-	"github.com/docker/docker/client"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/client/pkg/versions"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/docker/compose/v2/pkg/api"
+	"github.com/docker/compose/v5/pkg/api"
 )
 
 func (s *composeService) Images(ctx context.Context, projectName string, options api.ImagesOptions) (map[string]api.ImageSummary, error) {
 	projectName = strings.ToLower(projectName)
-	allContainers, err := s.apiClient().ContainerList(ctx, container.ListOptions{
+	allContainers, err := s.apiClient().ContainerList(ctx, client.ContainerListOptions{
 		All:     true,
-		Filters: filters.NewArgs(projectFilter(projectName)),
+		Filters: projectFilter(projectName),
 	})
 	if err != nil {
 		return nil, err
@@ -48,20 +47,22 @@ func (s *composeService) Images(ctx context.Context, projectName string, options
 	var containers []container.Summary
 	if len(options.Services) > 0 {
 		// filter service containers
-		for _, c := range allContainers {
+		for _, c := range allContainers.Items {
 			if slices.Contains(options.Services, c.Labels[api.ServiceLabel]) {
 				containers = append(containers, c)
 			}
 		}
 	} else {
-		containers = allContainers
+		containers = allContainers.Items
 	}
 
-	version, err := s.RuntimeVersion(ctx)
+	// The daemon validates the platform field in ImageInspect against the
+	// negotiated API version from the request path, not the server's own max version.
+	version, err := s.RuntimeAPIVersion(ctx)
 	if err != nil {
 		return nil, err
 	}
-	withPlatform := versions.GreaterThanOrEqualTo(version, "1.49")
+	withPlatform := versions.GreaterThanOrEqualTo(version, apiVersion149)
 
 	summary := map[string]api.ImageSummary{}
 	var mux sync.Mutex
@@ -91,9 +92,13 @@ func (s *composeService) Images(ctx context.Context, projectName string, options
 				}
 			}
 
-			created, err := time.Parse(time.RFC3339Nano, image.Created)
-			if err != nil {
-				return err
+			var created *time.Time
+			if image.Created != "" {
+				t, err := time.Parse(time.RFC3339Nano, image.Created)
+				if err != nil {
+					return err
+				}
+				created = &t
 			}
 
 			mux.Lock()

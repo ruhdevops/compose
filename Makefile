@@ -12,7 +12,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
-PKG := github.com/docker/compose/v2
+PKG := github.com/docker/compose/v5
 VERSION ?= $(shell git describe --match 'v[0-9]*' --dirty='.m' --always --tags)
 
 GO_LDFLAGS ?= -w -X ${PKG}/internal.Version=${VERSION}
@@ -62,11 +62,11 @@ build:
 
 .PHONY: binary
 binary:
-	$(BUILDX_CMD) bake binary
+	BUILD_TAGS="$(GO_BUILDTAGS)" $(BUILDX_CMD) bake binary
 
 .PHONY: binary-with-coverage
 binary-with-coverage:
-	$(BUILDX_CMD) bake binary-with-coverage
+	BUILD_TAGS="$(GO_BUILDTAGS)" $(BUILDX_CMD) bake binary-with-coverage
 
 .PHONY: install
 install: binary
@@ -95,7 +95,7 @@ example-provider: ## build example provider for e2e tests
 mocks:
 	mockgen --version >/dev/null 2>&1 || go install go.uber.org/mock/mockgen@v0.4.0
 	mockgen -destination pkg/mocks/mock_docker_cli.go -package mocks github.com/docker/cli/cli/command Cli
-	mockgen -destination pkg/mocks/mock_docker_api.go -package mocks github.com/docker/docker/client APIClient
+	mockgen -destination pkg/mocks/mock_docker_api.go -package mocks github.com/moby/moby/client APIClient
 	mockgen -destination pkg/mocks/mock_docker_compose_api.go -package mocks -source=./pkg/api/api.go Service
 
 .PHONY: e2e

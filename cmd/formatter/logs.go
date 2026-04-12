@@ -26,8 +26,9 @@ import (
 	"time"
 
 	"github.com/buger/goterm"
-	"github.com/docker/compose/v2/pkg/api"
-	"github.com/docker/docker/pkg/jsonmessage"
+	"github.com/moby/moby/client/pkg/jsonmessage"
+
+	"github.com/docker/compose/v5/pkg/api"
 )
 
 // LogConsumer consume logs from services and format them
@@ -86,7 +87,7 @@ func (l *logConsumer) register(name string) *presenter {
 	l.presenters.Store(name, p)
 	l.computeWidth()
 	if l.prefix {
-		l.presenters.Range(func(key, value interface{}) bool {
+		l.presenters.Range(func(key, value any) bool {
 			p := value.(*presenter)
 			p.setPrefix(l.width)
 			return true
@@ -119,7 +120,7 @@ func (l *logConsumer) write(w io.Writer, container, message string) {
 	}
 	p := l.getPresenter(container)
 	timestamp := time.Now().Format(jsonmessage.RFC3339NanoFixed)
-	for _, line := range strings.Split(message, "\n") {
+	for line := range strings.SplitSeq(message, "\n") {
 		if l.timestamp {
 			_, _ = fmt.Fprintf(w, "%s%s %s\n", p.prefix, timestamp, line)
 		} else {
@@ -136,7 +137,7 @@ func (l *logConsumer) Status(container, msg string) {
 
 func (l *logConsumer) computeWidth() {
 	width := 0
-	l.presenters.Range(func(key, value interface{}) bool {
+	l.presenters.Range(func(key, value any) bool {
 		p := value.(*presenter)
 		if len(p.name) > width {
 			width = len(p.name)

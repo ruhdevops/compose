@@ -24,14 +24,63 @@ import (
 	"strings"
 	"time"
 
+	"github.com/compose-spec/compose-go/v2/cli"
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/containerd/platforms"
 	"github.com/docker/cli/opts"
-	"github.com/docker/docker/api/types/volume"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/volume"
 )
 
-// Service manages a compose project
-type Service interface {
+// LoadListener receives events during project loading.
+// Events include:
+//   - "extends": when a service extends another (metadata: service info)
+//   - "include": when including external compose files (metadata: {"path": StringList})
+//
+// Multiple listeners can be registered, and all will be notified of events.
+type LoadListener func(event string, metadata map[string]any)
+
+// ProjectLoadOptions configures how a Compose project should be loaded
+type ProjectLoadOptions struct {
+	// ProjectName to use, or empty to infer from directory
+	ProjectName string
+	// ConfigPaths are paths to compose files
+	ConfigPaths []string
+	// WorkingDir is the project directory
+	WorkingDir string
+	// EnvFiles are paths to .env files
+	EnvFiles []string
+	// Profiles to activate
+	Profiles []string
+	// Services to select (empty = all)
+	Services []string
+	// Offline mode disables remote resource loading
+	Offline bool
+	// All includes all resources (not just those used by services)
+	All bool
+	// Compatibility enables v1 compatibility mode
+	Compatibility bool
+
+	// ProjectOptionsFns are compose-go project options to apply.
+	// Use cli.WithInterpolation(false), cli.WithNormalization(false), etc.
+	// This is optional - pass nil or empty slice to use defaults.
+	ProjectOptionsFns []cli.ProjectOptionsFn
+
+	// LoadListeners receive events during project loading.
+	// All registered listeners will be notified of events.
+	// This is optional - pass nil or empty slice if not needed.
+	LoadListeners []LoadListener
+
+	OCI OCIOptions
+}
+
+type OCIOptions struct {
+	InsecureRegistries []string
+}
+
+// Compose is the API interface one can use to programmatically use docker/compose in a third-party software
+// Use [compose.NewComposeService] to get an actual instance
+type Compose interface {
 	// Build executes the equivalent to a `compose build`
 	Build(ctx context.Context, project *types.Project, options BuildOptions) error
 	// Push executes the equivalent to a `compose push`
@@ -82,10 +131,6 @@ type Service interface {
 	Publish(ctx context.Context, project *types.Project, repository string, options PublishOptions) error
 	// Images executes the equivalent of a `compose images`
 	Images(ctx context.Context, projectName string, options ImagesOptions) (map[string]ImageSummary, error)
-	// MaxConcurrency defines upper limit for concurrent operations against engine API
-	MaxConcurrency(parallel int)
-	// DryRunMode defines if dry run applies to the command
-	DryRunMode(ctx context.Context, dryRun bool) (context.Context, error)
 	// Watch services' development context and sync/notify/rebuild/restart on changes
 	Watch(ctx context.Context, project *types.Project, options WatchOptions) error
 	// Viz generates a graphviz graph of the project services
@@ -102,13 +147,15 @@ type Service interface {
 	Generate(ctx context.Context, options GenerateOptions) (*types.Project, error)
 	// Volumes executes the equivalent to a `docker volume ls`
 	Volumes(ctx context.Context, project string, options VolumesOptions) ([]VolumesSummary, error)
+	// LoadProject loads and validates a Compose project from configuration files.
+	LoadProject(ctx context.Context, options ProjectLoadOptions) (*types.Project, error)
 }
 
 type VolumesOptions struct {
 	Services []string
 }
 
-type VolumesSummary = *volume.Volume
+type VolumesSummary = volume.Volume
 
 type ScaleOptions struct {
 	Services []string
@@ -231,8 +278,6 @@ type CreateOptions struct {
 	Timeout *time.Duration
 	// QuietPull makes the pulling process quiet
 	QuietPull bool
-	// AssumeYes assume "yes" as answer to all prompts and run non-interactively
-	AssumeYes bool
 }
 
 // StartOptions group options of the Start API
@@ -446,9 +491,9 @@ type PublishOptions struct {
 	ResolveImageDigests bool
 	Application         bool
 	WithEnvironment     bool
-
-	AssumeYes  bool
-	OCIVersion OCIVersion
+	OCIVersion          OCIVersion
+	// Use plain HTTP to access registry. Should only be used for testing purpose
+	InsecureRegistry bool
 }
 
 func (e Event) String() string {
@@ -500,9 +545,9 @@ type ContainerSummary struct {
 	Project      string
 	Service      string
 	Created      int64
-	State        string
+	State        container.ContainerState
 	Status       string
-	Health       string
+	Health       container.HealthStatus
 	ExitCode     int
 	Publishers   PortPublishers
 	Labels       map[string]string
@@ -559,7 +604,7 @@ type ImageSummary struct {
 	Tag         string
 	Platform    platforms.Platform
 	Size        int64
-	Created     time.Time
+	Created     *time.Time
 	LastTagTime time.Time
 }
 
@@ -698,7 +743,7 @@ const (
 	ContainerEventRecreated
 	// ContainerEventExited is a ContainerEvent of type exit. ExitCode is set
 	ContainerEventExited
-	// UserCancel user cancelled compose up, we are stopping containers
+	// UserCancel user canceled compose up, we are stopping containers
 	HookEventLog
 )
 

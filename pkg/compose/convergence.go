@@ -30,19 +30,19 @@ import (
 
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/containerd/platforms"
-	"github.com/docker/docker/api/types/container"
-	mmount "github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/api/types/versions"
+	"github.com/moby/moby/api/types/container"
+	mmount "github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/client/pkg/versions"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/docker/compose/v2/internal/tracing"
-	"github.com/docker/compose/v2/pkg/api"
-	"github.com/docker/compose/v2/pkg/progress"
-	"github.com/docker/compose/v2/pkg/utils"
+	"github.com/docker/compose/v5/internal/tracing"
+	"github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/utils"
 )
 
 const (
@@ -57,7 +57,7 @@ const (
 // Cross services dependencies are managed by creating services in expected order and updating `service:xx` reference
 // when a service has converged, so dependent ones can be managed with resolved containers references.
 type convergence struct {
-	service    *composeService
+	compose    *composeService
 	services   map[string]Containers
 	networks   map[string]string
 	volumes    map[string]string
@@ -86,7 +86,7 @@ func newConvergence(services []string, state Containers, networks map[string]str
 		observedState[service] = append(observedState[service], c)
 	}
 	return &convergence{
-		service:  s,
+		compose:  s,
 		services: observedState,
 		networks: networks,
 		volumes:  volumes,
@@ -112,7 +112,7 @@ func (c *convergence) apply(ctx context.Context, project *types.Project, options
 
 func (c *convergence) ensureService(ctx context.Context, project *types.Project, service types.ServiceConfig, recreate string, inherit bool, timeout *time.Duration) error { //nolint:gocyclo
 	if service.Provider != nil {
-		return c.service.runPlugin(ctx, project, service, "up")
+		return c.compose.runPlugin(ctx, project, service, "up")
 	}
 	expected, err := getScale(service)
 	if err != nil {
@@ -122,7 +122,7 @@ func (c *convergence) ensureService(ctx context.Context, project *types.Project,
 	actual := len(containers)
 	updated := make(Containers, expected)
 
-	eg, _ := errgroup.WithContext(ctx)
+	eg, ctx := errgroup.WithContext(ctx)
 
 	err = c.resolveServiceReferences(&service)
 	if err != nil {
@@ -159,7 +159,7 @@ func (c *convergence) ensureService(ctx context.Context, project *types.Project,
 			ctr := ctr
 			traceOpts := append(tracing.ServiceOptions(service), tracing.ContainerOptions(ctr)...)
 			eg.Go(tracing.SpanWrapFuncForErrGroup(ctx, "service/scale/down", traceOpts, func(ctx context.Context) error {
-				return c.service.stopAndRemoveContainer(ctx, ctr, &service, timeout, false)
+				return c.compose.stopAndRemoveContainer(ctx, ctr, &service, timeout, false)
 			}))
 			continue
 		}
@@ -176,7 +176,7 @@ func (c *convergence) ensureService(ctx context.Context, project *types.Project,
 
 			i, ctr := i, ctr
 			eg.Go(tracing.SpanWrapFuncForErrGroup(ctx, "container/recreate", tracing.ContainerOptions(ctr), func(ctx context.Context) error {
-				recreated, err := c.service.recreateContainer(ctx, project, service, ctr, inherit, timeout)
+				recreated, err := c.compose.recreateContainer(ctx, project, service, ctr, inherit, timeout)
 				updated[i] = recreated
 				return err
 			}))
@@ -184,18 +184,17 @@ func (c *convergence) ensureService(ctx context.Context, project *types.Project,
 		}
 
 		// Enforce non-diverged containers are running
-		w := progress.ContextWriter(ctx)
 		name := getContainerProgressName(ctr)
 		switch ctr.State {
 		case container.StateRunning:
-			w.Event(progress.RunningEvent(name))
+			c.compose.events.On(runningEvent(name))
 		case container.StateCreated:
 		case container.StateRestarting:
 		case container.StateExited:
 		default:
 			ctr := ctr
 			eg.Go(tracing.EventWrapFuncForErrGroup(ctx, "service/start", tracing.ContainerOptions(ctr), func(ctx context.Context) error {
-				return c.service.startContainer(ctx, ctr)
+				return c.compose.startContainer(ctx, ctr)
 			}))
 		}
 		updated[i] = ctr
@@ -214,7 +213,7 @@ func (c *convergence) ensureService(ctx context.Context, project *types.Project,
 				UseNetworkAliases: true,
 				Labels:            mergeLabels(service.Labels, service.CustomLabels),
 			}
-			ctr, err := c.service.createContainer(ctx, project, service, name, number, opts)
+			ctr, err := c.compose.createContainer(ctx, project, service, name, number, opts)
 			updated[actual+i] = ctr
 			return err
 		}))
@@ -234,7 +233,7 @@ func (c *convergence) stopDependentContainers(ctx context.Context, project *type
 	if len(dependents) == 0 {
 		return nil
 	}
-	err := c.service.stop(ctx, project.Name, api.StopOptions{
+	err := c.compose.stop(ctx, project.Name, api.StopOptions{
 		Services: dependents,
 		Project:  project,
 	}, nil)
@@ -427,16 +426,16 @@ func getContainerProgressName(ctr container.Summary) string {
 	return "Container " + getCanonicalContainerName(ctr)
 }
 
-func containerEvents(containers Containers, eventFunc func(string) progress.Event) []progress.Event {
-	events := []progress.Event{}
+func containerEvents(containers Containers, eventFunc func(string) api.Resource) []api.Resource {
+	events := []api.Resource{}
 	for _, ctr := range containers {
 		events = append(events, eventFunc(getContainerProgressName(ctr)))
 	}
 	return events
 }
 
-func containerReasonEvents(containers Containers, eventFunc func(string, string) progress.Event, reason string) []progress.Event {
-	events := []progress.Event{}
+func containerReasonEvents(containers Containers, eventFunc func(string, string) api.Resource, reason string) []api.Resource {
+	events := []api.Resource{}
 	for _, ctr := range containers {
 		events = append(events, eventFunc(getContainerProgressName(ctr), reason))
 	}
@@ -453,8 +452,7 @@ func (s *composeService) waitDependencies(ctx context.Context, project *types.Pr
 		defer cancelFunc()
 		ctx = withTimeout
 	}
-	eg, _ := errgroup.WithContext(ctx)
-	w := progress.ContextWriter(ctx)
+	eg, ctx := errgroup.WithContext(ctx)
 	for dep, config := range dependencies {
 		if shouldWait, err := shouldWaitForDependency(dep, config, project); err != nil {
 			return err
@@ -463,7 +461,7 @@ func (s *composeService) waitDependencies(ctx context.Context, project *types.Pr
 		}
 
 		waitingFor := containers.filter(isService(dep), isNotOneOff)
-		w.Events(containerEvents(waitingFor, progress.Waiting))
+		s.events.On(containerEvents(waitingFor, waiting)...)
 		if len(waitingFor) == 0 {
 			if config.Required {
 				return fmt.Errorf("%s is missing dependency %s", dependant, dep)
@@ -483,55 +481,62 @@ func (s *composeService) waitDependencies(ctx context.Context, project *types.Pr
 				}
 				switch config.Condition {
 				case ServiceConditionRunningOrHealthy:
-					healthy, err := s.isServiceHealthy(ctx, waitingFor, true)
+					isHealthy, err := s.isServiceHealthy(ctx, waitingFor, true)
 					if err != nil {
 						if !config.Required {
-							w.Events(containerReasonEvents(waitingFor, progress.SkippedEvent, fmt.Sprintf("optional dependency %q is not running or is unhealthy", dep)))
+							s.events.On(containerReasonEvents(waitingFor, skippedEvent,
+								fmt.Sprintf("optional dependency %q is not running or is unhealthy", dep))...)
 							logrus.Warnf("optional dependency %q is not running or is unhealthy: %s", dep, err.Error())
 							return nil
 						}
 						return err
 					}
-					if healthy {
-						w.Events(containerEvents(waitingFor, progress.Healthy))
+					if isHealthy {
+						s.events.On(containerEvents(waitingFor, healthy)...)
 						return nil
 					}
 				case types.ServiceConditionHealthy:
-					healthy, err := s.isServiceHealthy(ctx, waitingFor, false)
+					isHealthy, err := s.isServiceHealthy(ctx, waitingFor, false)
 					if err != nil {
 						if !config.Required {
-							w.Events(containerReasonEvents(waitingFor, progress.SkippedEvent, fmt.Sprintf("optional dependency %q failed to start", dep)))
+							s.events.On(containerReasonEvents(waitingFor, skippedEvent,
+								fmt.Sprintf("optional dependency %q failed to start", dep))...)
 							logrus.Warnf("optional dependency %q failed to start: %s", dep, err.Error())
 							return nil
 						}
-						w.Events(containerEvents(waitingFor, progress.ErrorEvent))
+						s.events.On(containerEvents(waitingFor, func(s string) api.Resource {
+							return errorEventf(s, "dependency %s failed to start", dep)
+						})...)
 						return fmt.Errorf("dependency failed to start: %w", err)
 					}
-					if healthy {
-						w.Events(containerEvents(waitingFor, progress.Healthy))
+					if isHealthy {
+						s.events.On(containerEvents(waitingFor, healthy)...)
 						return nil
 					}
 				case types.ServiceConditionCompletedSuccessfully:
-					exited, code, err := s.isServiceCompleted(ctx, waitingFor)
+					isExited, code, err := s.isServiceCompleted(ctx, waitingFor)
 					if err != nil {
 						return err
 					}
-					if exited {
+					if isExited {
 						if code == 0 {
-							w.Events(containerEvents(waitingFor, progress.Exited))
+							s.events.On(containerEvents(waitingFor, exited)...)
 							return nil
 						}
 
 						messageSuffix := fmt.Sprintf("%q didn't complete successfully: exit %d", dep, code)
 						if !config.Required {
 							// optional -> mark as skipped & don't propagate error
-							w.Events(containerReasonEvents(waitingFor, progress.SkippedEvent, fmt.Sprintf("optional dependency %s", messageSuffix)))
+							s.events.On(containerReasonEvents(waitingFor, skippedEvent,
+								fmt.Sprintf("optional dependency %s", messageSuffix))...)
 							logrus.Warnf("optional dependency %s", messageSuffix)
 							return nil
 						}
 
 						msg := fmt.Sprintf("service %s", messageSuffix)
-						w.Events(containerReasonEvents(waitingFor, progress.ErrorMessageEvent, msg))
+						s.events.On(containerEvents(waitingFor, func(s string) api.Resource {
+							return errorEventf(s, "service %s", messageSuffix)
+						})...)
 						return errors.New(msg)
 					}
 				default:
@@ -593,36 +598,34 @@ func nextContainerNumber(containers []container.Summary) int {
 func (s *composeService) createContainer(ctx context.Context, project *types.Project, service types.ServiceConfig,
 	name string, number int, opts createOptions,
 ) (ctr container.Summary, err error) {
-	w := progress.ContextWriter(ctx)
 	eventName := "Container " + name
-	w.Event(progress.CreatingEvent(eventName))
-	ctr, err = s.createMobyContainer(ctx, project, service, name, number, nil, opts, w)
+	s.events.On(creatingEvent(eventName))
+	ctr, err = s.createMobyContainer(ctx, project, service, name, number, nil, opts)
 	if err != nil {
 		if ctx.Err() == nil {
-			w.Event(progress.Event{
-				ID:         eventName,
-				Status:     progress.Error,
-				StatusText: err.Error(),
+			s.events.On(api.Resource{
+				ID:     eventName,
+				Status: api.Error,
+				Text:   err.Error(),
 			})
 		}
-		return
+		return ctr, err
 	}
-	w.Event(progress.CreatedEvent(eventName))
-	return
+	s.events.On(createdEvent(eventName))
+	return ctr, nil
 }
 
 func (s *composeService) recreateContainer(ctx context.Context, project *types.Project, service types.ServiceConfig,
 	replaced container.Summary, inherit bool, timeout *time.Duration,
 ) (created container.Summary, err error) {
-	w := progress.ContextWriter(ctx)
 	eventName := getContainerProgressName(replaced)
-	w.Event(progress.NewEvent(eventName, progress.Working, "Recreate"))
+	s.events.On(newEvent(eventName, api.Working, "Recreate"))
 	defer func() {
 		if err != nil && ctx.Err() == nil {
-			w.Event(progress.Event{
-				ID:         eventName,
-				Status:     progress.Error,
-				StatusText: err.Error(),
+			s.events.On(api.Resource{
+				ID:     eventName,
+				Status: api.Error,
+				Text:   err.Error(),
 			})
 		}
 	}()
@@ -649,28 +652,30 @@ func (s *composeService) recreateContainer(ctx context.Context, project *types.P
 		UseNetworkAliases: true,
 		Labels:            mergeLabels(service.Labels, service.CustomLabels).Add(api.ContainerReplaceLabel, replacedContainerName),
 	}
-	created, err = s.createMobyContainer(ctx, project, service, tmpName, number, inherited, opts, w)
+	created, err = s.createMobyContainer(ctx, project, service, tmpName, number, inherited, opts)
 	if err != nil {
 		return created, err
 	}
 
 	timeoutInSecond := utils.DurationSecondToInt(timeout)
-	err = s.apiClient().ContainerStop(ctx, replaced.ID, container.StopOptions{Timeout: timeoutInSecond})
+	_, err = s.apiClient().ContainerStop(ctx, replaced.ID, client.ContainerStopOptions{Timeout: timeoutInSecond})
 	if err != nil {
 		return created, err
 	}
 
-	err = s.apiClient().ContainerRemove(ctx, replaced.ID, container.RemoveOptions{})
+	_, err = s.apiClient().ContainerRemove(ctx, replaced.ID, client.ContainerRemoveOptions{})
 	if err != nil {
 		return created, err
 	}
 
-	err = s.apiClient().ContainerRename(ctx, tmpName, name)
+	_, err = s.apiClient().ContainerRename(ctx, tmpName, client.ContainerRenameOptions{
+		NewName: name,
+	})
 	if err != nil {
 		return created, err
 	}
 
-	w.Event(progress.NewEvent(eventName, progress.Done, "Recreated"))
+	s.events.On(newEvent(eventName, api.Done, "Recreated"))
 	return created, err
 }
 
@@ -678,26 +683,19 @@ func (s *composeService) recreateContainer(ctx context.Context, project *types.P
 var startMx sync.Mutex
 
 func (s *composeService) startContainer(ctx context.Context, ctr container.Summary) error {
-	w := progress.ContextWriter(ctx)
-	w.Event(progress.NewEvent(getContainerProgressName(ctr), progress.Working, "Restart"))
+	s.events.On(newEvent(getContainerProgressName(ctr), api.Working, "Restart"))
 	startMx.Lock()
 	defer startMx.Unlock()
-	err := s.apiClient().ContainerStart(ctx, ctr.ID, container.StartOptions{})
+	_, err := s.apiClient().ContainerStart(ctx, ctr.ID, client.ContainerStartOptions{})
 	if err != nil {
 		return err
 	}
-	w.Event(progress.NewEvent(getContainerProgressName(ctr), progress.Done, "Restarted"))
+	s.events.On(newEvent(getContainerProgressName(ctr), api.Done, "Restarted"))
 	return nil
 }
 
-func (s *composeService) createMobyContainer(ctx context.Context,
-	project *types.Project,
-	service types.ServiceConfig,
-	name string,
-	number int,
-	inherit *container.Summary,
-	opts createOptions,
-	w progress.Writer,
+func (s *composeService) createMobyContainer(ctx context.Context, project *types.Project, service types.ServiceConfig,
+	name string, number int, inherit *container.Summary, opts createOptions,
 ) (container.Summary, error) {
 	var created container.Summary
 	cfgs, err := s.getCreateConfigs(ctx, project, service, number, inherit, opts)
@@ -718,40 +716,32 @@ func (s *composeService) createMobyContainer(ctx context.Context,
 		plat = &p
 	}
 
-	response, err := s.apiClient().ContainerCreate(ctx, cfgs.Container, cfgs.Host, cfgs.Network, plat, name)
+	response, err := s.apiClient().ContainerCreate(ctx, client.ContainerCreateOptions{
+		Name:             name,
+		Platform:         plat,
+		Config:           cfgs.Container,
+		HostConfig:       cfgs.Host,
+		NetworkingConfig: cfgs.Network,
+	})
 	if err != nil {
 		return created, err
 	}
 	for _, warning := range response.Warnings {
-		w.Event(progress.Event{
+		s.events.On(api.Resource{
 			ID:     service.Name,
-			Status: progress.Warning,
+			Status: api.Warning,
 			Text:   warning,
 		})
 	}
-	inspectedContainer, err := s.apiClient().ContainerInspect(ctx, response.ID)
-	if err != nil {
-		return created, err
-	}
-	created = container.Summary{
-		ID:     inspectedContainer.ID,
-		Labels: inspectedContainer.Config.Labels,
-		Names:  []string{inspectedContainer.Name},
-		NetworkSettings: &container.NetworkSettingsSummary{
-			Networks: inspectedContainer.NetworkSettings.Networks,
-		},
-	}
-
-	apiVersion, err := s.RuntimeVersion(ctx)
-	if err != nil {
-		return created, err
-	}
 	// Starting API version 1.44, the ContainerCreate API call takes multiple networks
-	// so we include all the configurations there and can skip the one-by-one calls here
-	if versions.LessThan(apiVersion, "1.44") {
-		// the highest-priority network is the primary and is included in the ContainerCreate API
-		// call via container.NetworkMode & network.NetworkingConfig
-		// any remaining networks are connected one-by-one here after creation (but before start)
+	// so we include all configurations there and can skip the one-by-one calls here.
+	// For older API versions (e.g. Docker 20.10/API 1.41, Synology DSM 7.1/7.2),
+	// extra networks must be connected individually after creation via NetworkConnect.
+	apiVersion, err := s.RuntimeAPIVersion(ctx)
+	if err != nil {
+		return created, err
+	}
+	if versions.LessThan(apiVersion, apiVersion144) {
 		serviceNetworks := service.NetworksByPriority()
 		for _, networkKey := range serviceNetworks {
 			mobyNetworkName := project.Networks[networkKey].Name
@@ -759,12 +749,34 @@ func (s *composeService) createMobyContainer(ctx context.Context,
 				// primary network already configured as part of ContainerCreate
 				continue
 			}
-			epSettings := createEndpointSettings(project, service, number, networkKey, cfgs.Links, opts.UseNetworkAliases)
-			if err := s.apiClient().NetworkConnect(ctx, mobyNetworkName, created.ID, epSettings); err != nil {
+			epSettings, err := createEndpointSettings(project, service, number, networkKey, cfgs.Links, opts.UseNetworkAliases)
+			if err != nil {
+				_, _ = s.apiClient().ContainerRemove(ctx, response.ID, client.ContainerRemoveOptions{Force: true})
+				return created, err
+			}
+			if _, err := s.apiClient().NetworkConnect(ctx, mobyNetworkName, client.NetworkConnectOptions{
+				Container:      response.ID,
+				EndpointConfig: epSettings,
+			}); err != nil {
+				_, _ = s.apiClient().ContainerRemove(ctx, response.ID, client.ContainerRemoveOptions{Force: true})
 				return created, err
 			}
 		}
 	}
+
+	res, err := s.apiClient().ContainerInspect(ctx, response.ID, client.ContainerInspectOptions{})
+	if err != nil {
+		return created, err
+	}
+	created = container.Summary{
+		ID:     res.Container.ID,
+		Labels: res.Container.Config.Labels,
+		Names:  []string{res.Container.Name},
+		NetworkSettings: &container.NetworkSettingsSummary{
+			Networks: res.Container.NetworkSettings.Networks,
+		},
+	}
+
 	return created, nil
 }
 
@@ -779,11 +791,10 @@ func (s *composeService) getLinks(ctx context.Context, projectName string, servi
 	}
 
 	for _, rawLink := range service.Links {
-		linkSplit := strings.Split(rawLink, ":")
-		linkServiceName := linkSplit[0]
-		linkName := linkServiceName
-		if len(linkSplit) == 2 {
-			linkName = linkSplit[1] // linkName if informed like in: "serviceName:linkName"
+		// linkName if informed like in: "serviceName[:linkName]"
+		linkServiceName, linkName, ok := strings.Cut(rawLink, ":")
+		if !ok {
+			linkName = linkServiceName
 		}
 		cnts, err := getServiceContainers(linkServiceName)
 		if err != nil {
@@ -815,11 +826,9 @@ func (s *composeService) getLinks(ctx context.Context, projectName string, servi
 	}
 
 	for _, rawExtLink := range service.ExternalLinks {
-		extLinkSplit := strings.Split(rawExtLink, ":")
-		externalLink := extLinkSplit[0]
-		linkName := externalLink
-		if len(extLinkSplit) == 2 {
-			linkName = extLinkSplit[1]
+		externalLink, linkName, ok := strings.Cut(rawExtLink, ":")
+		if !ok {
+			linkName = externalLink
 		}
 		links = append(links, format(externalLink, linkName))
 	}
@@ -828,17 +837,19 @@ func (s *composeService) getLinks(ctx context.Context, projectName string, servi
 
 func (s *composeService) isServiceHealthy(ctx context.Context, containers Containers, fallbackRunning bool) (bool, error) {
 	for _, c := range containers {
-		ctr, err := s.apiClient().ContainerInspect(ctx, c.ID)
+		res, err := s.apiClient().ContainerInspect(ctx, c.ID, client.ContainerInspectOptions{})
 		if err != nil {
 			return false, err
 		}
+		ctr := res.Container
 		name := ctr.Name[1:]
 
 		if ctr.State.Status == container.StateExited {
 			return false, fmt.Errorf("container %s exited (%d)", name, ctr.State.ExitCode)
 		}
 
-		if ctr.Config.Healthcheck == nil && fallbackRunning {
+		noHealthcheck := ctr.Config.Healthcheck == nil || (len(ctr.Config.Healthcheck.Test) > 0 && ctr.Config.Healthcheck.Test[0] == "NONE")
+		if noHealthcheck && fallbackRunning {
 			// Container does not define a health check, but we can fall back to "running" state
 			return ctr.State != nil && ctr.State.Status == container.StateRunning, nil
 		}
@@ -862,12 +873,12 @@ func (s *composeService) isServiceHealthy(ctx context.Context, containers Contai
 
 func (s *composeService) isServiceCompleted(ctx context.Context, containers Containers) (bool, int, error) {
 	for _, c := range containers {
-		ctr, err := s.apiClient().ContainerInspect(ctx, c.ID)
+		res, err := s.apiClient().ContainerInspect(ctx, c.ID, client.ContainerInspectOptions{})
 		if err != nil {
 			return false, 0, err
 		}
-		if ctr.State != nil && ctr.State.Status == container.StateExited {
-			return true, ctr.State.ExitCode, nil
+		if res.Container.State != nil && res.Container.State.Status == container.StateExited {
+			return true, res.Container.State.ExitCode, nil
 		}
 	}
 	return false, 0, nil
@@ -894,7 +905,6 @@ func (s *composeService) startService(ctx context.Context,
 		return fmt.Errorf("service %q has no container to start", service.Name)
 	}
 
-	w := progress.ContextWriter(ctx)
 	for _, ctr := range containers.filter(isService(service.Name)) {
 		if ctr.State == container.StateRunning {
 			continue
@@ -911,8 +921,8 @@ func (s *composeService) startService(ctx context.Context,
 		}
 
 		eventName := getContainerProgressName(ctr)
-		w.Event(progress.StartingEvent(eventName))
-		err = s.apiClient().ContainerStart(ctx, ctr.ID, container.StartOptions{})
+		s.events.On(startingEvent(eventName))
+		_, err = s.apiClient().ContainerStart(ctx, ctr.ID, client.ContainerStartOptions{})
 		if err != nil {
 			return err
 		}
@@ -924,7 +934,7 @@ func (s *composeService) startService(ctx context.Context,
 			}
 		}
 
-		w.Event(progress.StartedEvent(eventName))
+		s.events.On(startedEvent(eventName))
 	}
 	return nil
 }

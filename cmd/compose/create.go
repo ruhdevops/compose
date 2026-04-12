@@ -30,7 +30,8 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
-	"github.com/docker/compose/v2/pkg/api"
+	"github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/compose"
 )
 
 type createOptions struct {
@@ -51,7 +52,7 @@ type createOptions struct {
 	AssumeYes     bool
 }
 
-func createCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service) *cobra.Command {
+func createCommand(p *ProjectOptions, dockerCli command.Cli, backendOptions *BackendOptions) *cobra.Command {
 	opts := createOptions{}
 	buildOpts := buildOptions{
 		ProjectOptions: p,
@@ -70,7 +71,7 @@ func createCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service
 			return nil
 		}),
 		RunE: p.WithServices(dockerCli, func(ctx context.Context, project *types.Project, services []string) error {
-			return runCreate(ctx, dockerCli, backend, opts, buildOpts, project, services)
+			return runCreate(ctx, dockerCli, backendOptions, opts, buildOpts, project, services)
 		}),
 		ValidArgsFunction: completeServiceNames(dockerCli, p),
 	}
@@ -95,7 +96,7 @@ func createCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service
 	return cmd
 }
 
-func runCreate(ctx context.Context, _ command.Cli, backend api.Service, createOpts createOptions, buildOpts buildOptions, project *types.Project, services []string) error {
+func runCreate(ctx context.Context, dockerCli command.Cli, backendOptions *BackendOptions, createOpts createOptions, buildOpts buildOptions, project *types.Project, services []string) error {
 	if err := createOpts.Apply(project); err != nil {
 		return err
 	}
@@ -109,6 +110,14 @@ func runCreate(ctx context.Context, _ command.Cli, backend api.Service, createOp
 		build = &bo
 	}
 
+	if createOpts.AssumeYes {
+		backendOptions.Options = append(backendOptions.Options, compose.WithPrompt(compose.AlwaysOkPrompt()))
+	}
+
+	backend, err := compose.NewComposeService(dockerCli, backendOptions.Options...)
+	if err != nil {
+		return err
+	}
 	return backend.Create(ctx, project, api.CreateOptions{
 		Build:                build,
 		Services:             services,
@@ -119,7 +128,6 @@ func runCreate(ctx context.Context, _ command.Cli, backend api.Service, createOp
 		Inherit:              !createOpts.noInherit,
 		Timeout:              createOpts.GetTimeout(),
 		QuietPull:            createOpts.quietPull,
-		AssumeYes:            createOpts.AssumeYes,
 	})
 }
 
@@ -190,12 +198,11 @@ func (opts createOptions) Apply(project *types.Project) error {
 
 func applyScaleOpts(project *types.Project, opts []string) error {
 	for _, scale := range opts {
-		split := strings.Split(scale, "=")
-		if len(split) != 2 {
+		name, val, ok := strings.Cut(scale, "=")
+		if !ok || val == "" {
 			return fmt.Errorf("invalid --scale option %q. Should be SERVICE=NUM", scale)
 		}
-		name := split[0]
-		replicas, err := strconv.Atoi(split[1])
+		replicas, err := strconv.Atoi(val)
 		if err != nil {
 			return err
 		}

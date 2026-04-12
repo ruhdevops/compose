@@ -21,9 +21,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/docker/compose/v2/pkg/api"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+	"gotest.tools/v3/assert"
+
+	"github.com/docker/compose/v5/pkg/api"
 )
 
 var topTestCases = []struct {
@@ -202,7 +202,7 @@ var topTestCases = []struct {
 }
 
 // TestRunTopCore only tests the core functionality of runTop: formatting
-// and printing of the output of (api.Service).Top().
+// and printing of the output of (api.Compose).Top().
 func TestRunTopCore(t *testing.T) {
 	t.Parallel()
 
@@ -220,20 +220,20 @@ func TestRunTopCore(t *testing.T) {
 
 		t.Run(tc.name, func(t *testing.T) {
 			header, entries := collectTop([]api.ContainerProcSummary{summary})
-			assert.Equal(t, tc.header, header)
-			assert.Equal(t, tc.entries, entries)
+			assert.DeepEqual(t, tc.header, header)
+			assert.DeepEqual(t, tc.entries, entries)
 
 			var buf bytes.Buffer
 			err := topPrint(&buf, header, entries)
 
-			require.NoError(t, err)
+			assert.NilError(t, err)
 			assert.Equal(t, tc.output, buf.String())
 		})
 	}
 
 	t.Run("all", func(t *testing.T) {
 		header, entries := collectTop(all)
-		assert.Equal(t, topHeader{
+		assert.DeepEqual(t, topHeader{
 			"SERVICE": 0,
 			"#":       1,
 			"UID":     2,
@@ -246,7 +246,7 @@ func TestRunTopCore(t *testing.T) {
 			"GID":     9,
 			"CMD":     10,
 		}, header)
-		assert.Equal(t, []topEntries{
+		assert.DeepEqual(t, []topEntries{
 			{
 				"SERVICE": "simple",
 				"#":       "1",
@@ -307,7 +307,7 @@ func TestRunTopCore(t *testing.T) {
 
 		var buf bytes.Buffer
 		err := topPrint(&buf, header, entries)
-		require.NoError(t, err)
+		assert.NilError(t, err)
 		assert.Equal(t, trim(`
 			SERVICE    #   UID   PID  PPID  C   STIME  TTY  TIME      GID  CMD
 			simple     1   root  1    1     0   12:00  ?    00:00:01  -    /entrypoint
@@ -321,7 +321,7 @@ func TestRunTopCore(t *testing.T) {
 
 func trim(s string) string {
 	var out bytes.Buffer
-	for _, line := range strings.Split(strings.TrimSpace(s), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(s), "\n") {
 		out.WriteString(strings.TrimSpace(line))
 		out.WriteRune('\n')
 	}

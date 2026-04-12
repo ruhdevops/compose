@@ -15,9 +15,9 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
-ARG GO_VERSION=1.24.9
-ARG XX_VERSION=1.6.1
-ARG GOLANGCI_LINT_VERSION=v2.0.2
+ARG GO_VERSION=1.25.8
+ARG XX_VERSION=1.9.0
+ARG GOLANGCI_LINT_VERSION=v2.11.3
 ARG ADDLICENSE_VERSION=v1.0.0
 
 ARG BUILD_TAGS="e2e"
@@ -28,12 +28,12 @@ ARG LICENSE_FILES=".*\(Dockerfile\|Makefile\|\.go\|\.hcl\|\.sh\)"
 FROM --platform=${BUILDPLATFORM} tonistiigi/xx:${XX_VERSION} AS xx
 
 # osxcross contains the MacOSX cross toolchain for xx
-FROM crazymax/osxcross:11.3-alpine AS osxcross
+FROM crazymax/osxcross:15.5-alpine AS osxcross
 
 FROM golangci/golangci-lint:${GOLANGCI_LINT_VERSION}-alpine AS golangci-lint
 FROM ghcr.io/google/addlicense:${ADDLICENSE_VERSION} AS addlicense
 
-FROM --platform=${BUILDPLATFORM} golang:${GO_VERSION}-alpine AS base
+FROM --platform=${BUILDPLATFORM} golang:${GO_VERSION}-alpine3.22 AS base
 COPY --from=xx / /
 RUN apk add --no-cache \
       clang \
@@ -83,7 +83,7 @@ RUN --mount=type=bind,target=. \
     --mount=type=cache,target=/go/pkg/mod \
     --mount=type=bind,from=osxcross,src=/osxsdk,target=/xx-sdk \
     xx-go --wrap && \
-    if [ "$(xx-info os)" == "darwin" ]; then export CGO_ENABLED=1; fi && \
+    if [ "$(xx-info os)" == "darwin" ]; then export CGO_ENABLED=1; export BUILD_TAGS=fsnotify,$BUILD_TAGS; fi && \
     make build GO_BUILDTAGS="$BUILD_TAGS" DESTDIR=/out && \
     xx-verify --static /out/docker-compose
 
@@ -195,3 +195,16 @@ RUN --mount=from=binary \
 
 FROM scratch AS release
 COPY --from=releaser /out/ /
+
+FROM --platform=$BUILDPLATFORM alpine AS module-releaser
+WORKDIR /work
+ARG TARGETOS
+RUN --mount=from=binary \
+    mkdir -p /cli-plugins/compose/$TARGETOS && \
+    cp docker-compose* "/cli-plugins/compose/$TARGETOS/docker-compose$(ls docker-compose* | sed -e 's/^docker-compose//')"
+
+FROM scratch AS module
+ARG TARGETOS
+COPY --from=module-releaser /cli-plugins/compose/$TARGETOS /cli-plugins/compose/$TARGETOS
+COPY ./desktop-module/module-metadata.json /
+COPY LICENSE /

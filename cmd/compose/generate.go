@@ -21,8 +21,11 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/docker/compose/v2/pkg/api"
+	"github.com/docker/cli/cli/command"
 	"github.com/spf13/cobra"
+
+	"github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/compose"
 )
 
 type generateOptions struct {
@@ -30,7 +33,7 @@ type generateOptions struct {
 	Format string
 }
 
-func generateCommand(p *ProjectOptions, backend api.Service) *cobra.Command {
+func generateCommand(p *ProjectOptions, dockerCli command.Cli, backendOptions *BackendOptions) *cobra.Command {
 	opts := generateOptions{
 		ProjectOptions: p,
 	}
@@ -42,7 +45,7 @@ func generateCommand(p *ProjectOptions, backend api.Service) *cobra.Command {
 			return nil
 		}),
 		RunE: Adapt(func(ctx context.Context, args []string) error {
-			return runGenerate(ctx, backend, opts, args)
+			return runGenerate(ctx, dockerCli, backendOptions, opts, args)
 		}),
 	}
 
@@ -52,10 +55,15 @@ func generateCommand(p *ProjectOptions, backend api.Service) *cobra.Command {
 	return cmd
 }
 
-func runGenerate(ctx context.Context, backend api.Service, opts generateOptions, containers []string) error {
+func runGenerate(ctx context.Context, dockerCli command.Cli, backendOptions *BackendOptions, opts generateOptions, containers []string) error {
 	_, _ = fmt.Fprintln(os.Stderr, "generate command is EXPERIMENTAL")
 	if len(containers) == 0 {
 		return fmt.Errorf("at least one container must be specified")
+	}
+
+	backend, err := compose.NewComposeService(dockerCli, backendOptions.Options...)
+	if err != nil {
+		return err
 	}
 	project, err := backend.Generate(ctx, api.GenerateOptions{
 		Containers:  containers,
@@ -64,6 +72,7 @@ func runGenerate(ctx context.Context, backend api.Service, opts generateOptions,
 	if err != nil {
 		return err
 	}
+
 	var content []byte
 	switch opts.Format {
 	case "json":

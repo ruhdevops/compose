@@ -26,10 +26,11 @@ import (
 	"github.com/docker/cli/cli-plugins/metadata"
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/cli/cli/flags"
-	"github.com/docker/compose/v2/internal"
-	"github.com/docker/docker/client"
+	"github.com/moby/moby/client"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
+
+	"github.com/docker/compose/v5/internal"
 )
 
 // prepareShellOut prepare a shell-out command to be ran by Compose
@@ -52,8 +53,10 @@ func (s *composeService) prepareShellOut(gctx context.Context, env types.Mapping
 func (s *composeService) propagateDockerEndpoint() ([]string, func(), error) {
 	cleanup := func() {}
 	env := types.Mapping{}
+
 	env[command.EnvOverrideContext] = s.dockerCli.CurrentContext()
 	env["USER_AGENT"] = "compose/" + internal.Version
+
 	endpoint := s.dockerCli.DockerEndpoint()
 	env[client.EnvOverrideHost] = endpoint.Host
 	if endpoint.TLSData != nil {

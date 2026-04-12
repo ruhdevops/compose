@@ -25,13 +25,13 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/docker/compose/v2/pkg/progress"
+	"github.com/docker/cli/cli/command"
+	"github.com/moby/go-archive"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/docker/cli/cli/command"
-	"github.com/docker/compose/v2/pkg/api"
-	"github.com/docker/docker/api/types/container"
-	"github.com/moby/go-archive"
+	"github.com/docker/compose/v5/pkg/api"
 )
 
 type copyDirection int
@@ -43,9 +43,9 @@ const (
 )
 
 func (s *composeService) Copy(ctx context.Context, projectName string, options api.CopyOptions) error {
-	return progress.RunWithTitle(ctx, func(ctx context.Context) error {
+	return Run(ctx, func(ctx context.Context) error {
 		return s.copy(ctx, projectName, options)
-	}, s.stdinfo(), "Copying")
+	}, "copy", s.events)
 }
 
 func (s *composeService) copy(ctx context.Context, projectName string, options api.CopyOptions) error {
@@ -79,7 +79,6 @@ func (s *composeService) copy(ctx context.Context, projectName string, options a
 		return err
 	}
 
-	w := progress.ContextWriter(ctx)
 	g := errgroup.Group{}
 	for _, cont := range containers {
 		ctr := cont
@@ -87,24 +86,24 @@ func (s *composeService) copy(ctx context.Context, projectName string, options a
 			name := getCanonicalContainerName(ctr)
 			var msg string
 			if direction == fromService {
-				msg = fmt.Sprintf("copy %s:%s to %s", name, srcPath, dstPath)
+				msg = fmt.Sprintf("%s:%s to %s", name, srcPath, dstPath)
 			} else {
-				msg = fmt.Sprintf("copy %s to %s:%s", srcPath, name, dstPath)
+				msg = fmt.Sprintf("%s to %s:%s", srcPath, name, dstPath)
 			}
-			w.Event(progress.Event{
-				ID:         name,
-				Text:       msg,
-				Status:     progress.Working,
-				StatusText: "Copying",
+			s.events.On(api.Resource{
+				ID:      name,
+				Text:    api.StatusCopying,
+				Details: msg,
+				Status:  api.Working,
 			})
 			if err := copyFunc(ctx, ctr.ID, srcPath, dstPath, options); err != nil {
 				return err
 			}
-			w.Event(progress.Event{
-				ID:         name,
-				Text:       msg,
-				Status:     progress.Done,
-				StatusText: "Copied",
+			s.events.On(api.Resource{
+				ID:      name,
+				Text:    api.StatusCopied,
+				Details: msg,
+				Status:  api.Done,
 			})
 			return nil
 		})
@@ -155,7 +154,13 @@ func (s *composeService) copyToContainer(ctx context.Context, containerID string
 
 	// Prepare destination copy info by stat-ing the container path.
 	dstInfo := archive.CopyInfo{Path: dstPath}
-	dstStat, err := s.apiClient().ContainerStatPath(ctx, containerID, dstPath)
+	var dstStat container.PathStat
+	res, err := s.apiClient().ContainerStatPath(ctx, containerID, client.ContainerStatPathOptions{
+		Path: dstPath,
+	})
+	if err == nil {
+		dstStat = res.Stat
+	}
 
 	// If the destination is a symbolic link, we should evaluate it.
 	if err == nil && dstStat.Mode&os.ModeSymlink != 0 {
@@ -167,7 +172,12 @@ func (s *composeService) copyToContainer(ctx context.Context, containerID string
 		}
 
 		dstInfo.Path = linkTarget
-		dstStat, err = s.apiClient().ContainerStatPath(ctx, containerID, linkTarget)
+		res, err = s.apiClient().ContainerStatPath(ctx, containerID, client.ContainerStatPathOptions{
+			Path: linkTarget,
+		})
+		if err == nil {
+			dstStat = res.Stat
+		}
 	}
 
 	// Validate the destination path
@@ -234,11 +244,13 @@ func (s *composeService) copyToContainer(ctx context.Context, containerID string
 		}
 	}
 
-	options := container.CopyToContainerOptions{
+	_, err = s.apiClient().CopyToContainer(ctx, containerID, client.CopyToContainerOptions{
+		DestinationPath:           resolvedDstPath,
+		Content:                   content,
 		AllowOverwriteDirWithFile: false,
 		CopyUIDGID:                opts.CopyUIDGID,
-	}
-	return s.apiClient().CopyToContainer(ctx, containerID, resolvedDstPath, content, options)
+	})
+	return err
 }
 
 func (s *composeService) copyFromContainer(ctx context.Context, containerID, srcPath, dstPath string, opts api.CopyOptions) error {
@@ -258,7 +270,13 @@ func (s *composeService) copyFromContainer(ctx context.Context, containerID, src
 	// if client requests to follow symbol link, then must decide target file to be copied
 	var rebaseName string
 	if opts.FollowLink {
-		srcStat, err := s.apiClient().ContainerStatPath(ctx, containerID, srcPath)
+		var srcStat container.PathStat
+		res, err := s.apiClient().ContainerStatPath(ctx, containerID, client.ContainerStatPathOptions{
+			Path: srcPath,
+		})
+		if err == nil {
+			srcStat = res.Stat
+		}
 
 		// If the destination is a symbolic link, we should follow it.
 		if err == nil && srcStat.Mode&os.ModeSymlink != 0 {
@@ -274,28 +292,30 @@ func (s *composeService) copyFromContainer(ctx context.Context, containerID, src
 		}
 	}
 
-	content, stat, err := s.apiClient().CopyFromContainer(ctx, containerID, srcPath)
+	res, err := s.apiClient().CopyFromContainer(ctx, containerID, client.CopyFromContainerOptions{
+		SourcePath: srcPath,
+	})
 	if err != nil {
 		return err
 	}
-	defer content.Close() //nolint:errcheck
+	defer res.Content.Close() //nolint:errcheck
 
 	if dstPath == "-" {
-		_, err = io.Copy(s.stdout(), content)
+		_, err = io.Copy(s.stdout(), res.Content)
 		return err
 	}
 
 	srcInfo := archive.CopyInfo{
 		Path:       srcPath,
 		Exists:     true,
-		IsDir:      stat.Mode.IsDir(),
+		IsDir:      res.Stat.Mode.IsDir(),
 		RebaseName: rebaseName,
 	}
 
-	preArchive := content
+	preArchive := res.Content
 	if srcInfo.RebaseName != "" {
 		_, srcBase := archive.SplitPathDirEntry(srcInfo.Path)
-		preArchive = archive.RebaseArchiveEntries(content, srcBase, srcInfo.RebaseName)
+		preArchive = archive.RebaseArchiveEntries(res.Content, srcBase, srcInfo.RebaseName)
 	}
 
 	return archive.CopyTo(preArchive, srcInfo, dstPath)
@@ -319,20 +339,20 @@ func splitCpArg(arg string) (ctr, path string) {
 		return "", arg
 	}
 
-	parts := strings.SplitN(arg, ":", 2)
+	ctr, path, ok := strings.Cut(arg, ":")
 
-	if len(parts) == 1 || strings.HasPrefix(parts[0], ".") {
+	if !ok || strings.HasPrefix(ctr, ".") {
 		// Either there's no `:` in the arg
 		// OR it's an explicit local relative path like `./file:name.txt`.
 		return "", arg
 	}
 
-	return parts[0], parts[1]
+	return ctr, path
 }
 
 func resolveLocalPath(localPath string) (absPath string, err error) {
 	if absPath, err = filepath.Abs(localPath); err != nil {
-		return
+		return absPath, err
 	}
 	return archive.PreserveTrailingDotOrSeparator(absPath, localPath), nil
 }

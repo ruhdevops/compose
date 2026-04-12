@@ -21,14 +21,13 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/docker/compose/v2/pkg/api"
-	"github.com/docker/compose/v2/pkg/progress"
+	"github.com/docker/compose/v5/pkg/api"
 )
 
 func (s *composeService) Stop(ctx context.Context, projectName string, options api.StopOptions) error {
-	return progress.RunWithTitle(ctx, func(ctx context.Context) error {
+	return Run(ctx, func(ctx context.Context) error {
 		return s.stop(ctx, strings.ToLower(projectName), options, nil)
-	}, s.stdinfo(), "Stopping")
+	}, "stop", s.events)
 }
 
 func (s *composeService) stop(ctx context.Context, projectName string, options api.StopOptions, event api.ContainerEventListener) error {
@@ -49,12 +48,11 @@ func (s *composeService) stop(ctx context.Context, projectName string, options a
 		options.Services = project.ServiceNames()
 	}
 
-	w := progress.ContextWriter(ctx)
 	return InReverseDependencyOrder(ctx, project, func(c context.Context, service string) error {
 		if !slices.Contains(options.Services, service) {
 			return nil
 		}
 		serv := project.Services[service]
-		return s.stopContainers(ctx, w, &serv, containers.filter(isService(service)).filter(isNotOneOff), options.Timeout, event)
+		return s.stopContainers(ctx, &serv, containers.filter(isService(service)).filter(isNotOneOff), options.Timeout, event)
 	})
 }

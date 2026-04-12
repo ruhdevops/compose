@@ -19,17 +19,17 @@ import (
 	"context"
 
 	"github.com/compose-spec/compose-go/v2/types"
-	"github.com/docker/compose/v2/internal/tracing"
-	"github.com/docker/compose/v2/pkg/api"
-	"github.com/docker/compose/v2/pkg/progress"
+
+	"github.com/docker/compose/v5/internal/tracing"
+	"github.com/docker/compose/v5/pkg/api"
 )
 
 func (s *composeService) Scale(ctx context.Context, project *types.Project, options api.ScaleOptions) error {
-	return progress.Run(ctx, tracing.SpanWrapFunc("project/scale", tracing.ProjectOptions(ctx, project), func(ctx context.Context) error {
+	return Run(ctx, tracing.SpanWrapFunc("project/scale", tracing.ProjectOptions(ctx, project), func(ctx context.Context) error {
 		err := s.create(ctx, project, api.CreateOptions{Services: options.Services})
 		if err != nil {
 			return err
 		}
 		return s.start(ctx, project.Name, api.StartOptions{Project: project, Services: options.Services}, nil)
-	}), s.stdinfo())
+	}), "scale", s.events)
 }

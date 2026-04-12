@@ -24,10 +24,10 @@ import (
 	"testing"
 
 	"github.com/compose-spec/compose-go/v2/types"
-	"github.com/docker/compose/v2/pkg/utils"
-	testify "github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
+
+	"github.com/docker/compose/v5/pkg/utils"
 )
 
 func createTestProject() *types.Project {
@@ -70,9 +70,6 @@ func TestTraversalWithMultipleParents(t *testing.T) {
 		project.Services[name] = svc
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-
 	svc := make(chan string, 10)
 	seen := make(map[string]int)
 	done := make(chan struct{})
@@ -83,44 +80,38 @@ func TestTraversalWithMultipleParents(t *testing.T) {
 		done <- struct{}{}
 	}()
 
-	err := InDependencyOrder(ctx, &project, func(ctx context.Context, service string) error {
+	err := InDependencyOrder(t.Context(), &project, func(ctx context.Context, service string) error {
 		svc <- service
 		return nil
 	})
-	require.NoError(t, err, "Error during iteration")
+	assert.NilError(t, err, "Error during iteration")
 	close(svc)
 	<-done
 
-	testify.Len(t, seen, 101)
+	assert.Check(t, is.Len(seen, 101))
 	for svc, count := range seen {
 		assert.Equal(t, 1, count, "Service: %s", svc)
 	}
 }
 
 func TestInDependencyUpCommandOrder(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-
 	var order []string
-	err := InDependencyOrder(ctx, createTestProject(), func(ctx context.Context, service string) error {
+	err := InDependencyOrder(t.Context(), createTestProject(), func(ctx context.Context, service string) error {
 		order = append(order, service)
 		return nil
 	})
-	require.NoError(t, err, "Error during iteration")
-	require.Equal(t, []string{"test3", "test2", "test1"}, order)
+	assert.NilError(t, err, "Error during iteration")
+	assert.DeepEqual(t, []string{"test3", "test2", "test1"}, order)
 }
 
 func TestInDependencyReverseDownCommandOrder(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-
 	var order []string
-	err := InReverseDependencyOrder(ctx, createTestProject(), func(ctx context.Context, service string) error {
+	err := InReverseDependencyOrder(t.Context(), createTestProject(), func(ctx context.Context, service string) error {
 		order = append(order, service)
 		return nil
 	})
-	require.NoError(t, err, "Error during iteration")
-	require.Equal(t, []string{"test1", "test2", "test3"}, order)
+	assert.NilError(t, err, "Error during iteration")
+	assert.DeepEqual(t, []string{"test1", "test2", "test3"}, order)
 }
 
 func TestBuildGraph(t *testing.T) {
@@ -428,7 +419,7 @@ func TestWith_RootNodesAndUp(t *testing.T) {
 				return nil
 			})
 			WithRootNodesAndDown(tt.nodes)(gt)
-			err := gt.visit(context.TODO(), graph)
+			err := gt.visit(t.Context(), graph)
 			assert.NilError(t, err)
 			sort.Strings(visited)
 			assert.DeepEqual(t, tt.want, visited)

@@ -187,8 +187,8 @@ func TestLocalComposeRun(t *testing.T) {
 		res.Assert(t, icmd.Success)
 
 		res = c.RunDockerComposeCmd(t, "-f", "./fixtures/run-test/pull.yaml", "run", "--pull", "always", "backend")
-		assert.Assert(t, strings.Contains(res.Combined(), "backend Pulling"), res.Combined())
-		assert.Assert(t, strings.Contains(res.Combined(), "backend Pulled"), res.Combined())
+		assert.Assert(t, strings.Contains(res.Combined(), "Image nginx Pulling"), res.Combined())
+		assert.Assert(t, strings.Contains(res.Combined(), "Image nginx Pulled"), res.Combined())
 	})
 
 	t.Run("compose run --env-from-file", func(t *testing.T) {
@@ -260,7 +260,7 @@ func TestLocalComposeRun(t *testing.T) {
 
 		res.Assert(t, icmd.Expected{
 			ExitCode: 1,
-			Err:      "the input device is not a TTY",
+			Err:      "cannot attach stdin to a TTY-enabled container because stdin is not a terminal",
 		})
 	})
 
@@ -275,7 +275,7 @@ func TestLocalComposeRun(t *testing.T) {
 
 		res.Assert(t, icmd.Expected{
 			ExitCode: 1,
-			Err:      "the input device is not a TTY",
+			Err:      "cannot attach stdin to a TTY-enabled container because stdin is not a terminal",
 		})
 	})
 }

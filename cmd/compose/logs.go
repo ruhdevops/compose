@@ -23,8 +23,9 @@ import (
 	"github.com/docker/cli/cli/command"
 	"github.com/spf13/cobra"
 
-	"github.com/docker/compose/v2/cmd/formatter"
-	"github.com/docker/compose/v2/pkg/api"
+	"github.com/docker/compose/v5/cmd/formatter"
+	"github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/compose"
 )
 
 type logsOptions struct {
@@ -40,7 +41,7 @@ type logsOptions struct {
 	timestamps bool
 }
 
-func logsCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service) *cobra.Command {
+func logsCommand(p *ProjectOptions, dockerCli command.Cli, backendOptions *BackendOptions) *cobra.Command {
 	opts := logsOptions{
 		ProjectOptions: p,
 	}
@@ -48,7 +49,7 @@ func logsCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service) 
 		Use:   "logs [OPTIONS] [SERVICE...]",
 		Short: "View output from containers",
 		RunE: Adapt(func(ctx context.Context, args []string) error {
-			return runLogs(ctx, dockerCli, backend, opts, args)
+			return runLogs(ctx, dockerCli, backendOptions, opts, args)
 		}),
 		PreRunE: func(cmd *cobra.Command, args []string) error {
 			if opts.index > 0 && len(args) != 1 {
@@ -70,7 +71,7 @@ func logsCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service) 
 	return logsCmd
 }
 
-func runLogs(ctx context.Context, dockerCli command.Cli, backend api.Service, opts logsOptions, services []string) error {
+func runLogs(ctx context.Context, dockerCli command.Cli, backendOptions *BackendOptions, opts logsOptions, services []string) error {
 	project, name, err := opts.projectOrName(ctx, dockerCli, services...)
 	if err != nil {
 		return err
@@ -85,6 +86,10 @@ func runLogs(ctx context.Context, dockerCli command.Cli, backend api.Service, op
 		}
 	}
 
+	backend, err := compose.NewComposeService(dockerCli, backendOptions.Options...)
+	if err != nil {
+		return err
+	}
 	consumer := formatter.NewLogConsumer(ctx, dockerCli.Out(), dockerCli.Err(), !opts.noColor, !opts.noPrefix, false)
 	return backend.Logs(ctx, name, consumer, api.LogOptions{
 		Project:    project,
@@ -95,5 +100,34 @@ func runLogs(ctx context.Context, dockerCli command.Cli, backend api.Service, op
 		Since:      opts.since,
 		Until:      opts.until,
 		Timestamps: opts.timestamps,
+	})
+}
+
+var _ api.LogConsumer = &logConsumer{}
+
+type logConsumer struct {
+	events api.EventProcessor
+}
+
+func (l logConsumer) Log(containerName, message string) {
+	l.events.On(api.Resource{
+		ID:   containerName,
+		Text: message,
+	})
+}
+
+func (l logConsumer) Err(containerName, message string) {
+	l.events.On(api.Resource{
+		ID:     containerName,
+		Status: api.Error,
+		Text:   message,
+	})
+}
+
+func (l logConsumer) Status(containerName, message string) {
+	l.events.On(api.Resource{
+		ID:     containerName,
+		Status: api.Error,
+		Text:   message,
 	})
 }

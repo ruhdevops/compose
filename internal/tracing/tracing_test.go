@@ -21,14 +21,14 @@ import (
 
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/cli/cli/context/store"
-	"github.com/stretchr/testify/require"
+	"gotest.tools/v3/assert"
 
-	"github.com/docker/compose/v2/internal/tracing"
+	"github.com/docker/compose/v5/internal/tracing"
 )
 
 var testStoreCfg = store.NewConfig(
-	func() interface{} {
-		return &map[string]interface{}{}
+	func() any {
+		return &map[string]any{}
 	},
 )
 
@@ -44,17 +44,17 @@ func TestExtractOtelFromContext(t *testing.T) {
 		Name: "test",
 		Metadata: command.DockerContext{
 			Description: t.Name(),
-			AdditionalFields: map[string]interface{}{
-				"otel": map[string]interface{}{
+			AdditionalFields: map[string]any{
+				"otel": map[string]any{
 					"OTEL_EXPORTER_OTLP_ENDPOINT": "localhost:1234",
 				},
 			},
 		},
-		Endpoints: make(map[string]interface{}),
+		Endpoints: make(map[string]any),
 	})
-	require.NoError(t, err)
+	assert.NilError(t, err)
 
 	cfg, err := tracing.ConfigFromDockerContext(st, "test")
-	require.NoError(t, err)
-	require.Equal(t, "localhost:1234", cfg.Endpoint)
+	assert.NilError(t, err)
+	assert.Equal(t, "localhost:1234", cfg.Endpoint)
 }

@@ -27,28 +27,27 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
+	"gotest.tools/v3/assert"
 )
 
 // Each implementation of the notify interface should have the same basic
 // behavior.
 
 func TestWindowsBufferSize(t *testing.T) {
-	orig := os.Getenv(WindowsBufferSizeEnvVar)
-	defer os.Setenv(WindowsBufferSizeEnvVar, orig) //nolint:errcheck
+	t.Run("empty value", func(t *testing.T) {
+		t.Setenv(WindowsBufferSizeEnvVar, "")
+		assert.Equal(t, defaultBufferSize, DesiredWindowsBufferSize())
+	})
 
-	err := os.Setenv(WindowsBufferSizeEnvVar, "")
-	require.NoError(t, err)
-	assert.Equal(t, defaultBufferSize, DesiredWindowsBufferSize())
+	t.Run("invalid value", func(t *testing.T) {
+		t.Setenv(WindowsBufferSizeEnvVar, "a")
+		assert.Equal(t, defaultBufferSize, DesiredWindowsBufferSize())
+	})
 
-	err = os.Setenv(WindowsBufferSizeEnvVar, "a")
-	require.NoError(t, err)
-	assert.Equal(t, defaultBufferSize, DesiredWindowsBufferSize())
-
-	err = os.Setenv(WindowsBufferSizeEnvVar, "10")
-	require.NoError(t, err)
-	assert.Equal(t, 10, DesiredWindowsBufferSize())
+	t.Run("valid value", func(t *testing.T) {
+		t.Setenv(WindowsBufferSizeEnvVar, "10")
+		assert.Equal(t, 10, DesiredWindowsBufferSize())
+	})
 }
 
 func TestNoEvents(t *testing.T) {
@@ -114,11 +113,11 @@ func TestGitBranchSwitch(t *testing.T) {
 	f.events = nil
 
 	// consume all the events in the background
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := f.consumeEventsInBackground(ctx)
 
 	for i, dir := range dirs {
-		for j := 0; j < count; j++ {
+		for j := range count {
 			base := fmt.Sprintf("x/y/dir-%d/x.txt", j)
 			p := filepath.Join(dir, base)
 			f.WriteFile(p, "contents")
@@ -126,7 +125,7 @@ func TestGitBranchSwitch(t *testing.T) {
 
 		if i != 0 {
 			err := os.RemoveAll(dir)
-			require.NoError(t, err)
+			assert.NilError(t, err)
 		}
 	}
 
@@ -149,7 +148,7 @@ func TestGitBranchSwitch(t *testing.T) {
 	f.assertEvents(path)
 
 	// Make sure there are no errors in the out stream
-	assert.Empty(t, f.out.String())
+	assert.Assert(t, f.out.String() == "")
 }
 
 func TestWatchesAreRecursive(t *testing.T) {
@@ -357,7 +356,7 @@ func TestWatchBrokenLink(t *testing.T) {
 
 	f.watch(newRoot.Path())
 	err = os.Remove(link)
-	require.NoError(t, err)
+	assert.NilError(t, err)
 	f.assertEvents(link)
 }
 
@@ -501,7 +500,7 @@ type notifyFixture struct {
 
 func newNotifyFixture(t *testing.T) *notifyFixture {
 	out := bytes.NewBuffer(nil)
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	nf := &notifyFixture{
 		ctx:            ctx,
 		cancel:         cancel,

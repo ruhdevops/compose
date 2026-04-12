@@ -23,15 +23,16 @@ import (
 	"strings"
 
 	"github.com/docker/cli/cli/command"
-	"github.com/docker/compose/v2/pkg/api"
-	"github.com/docker/compose/v2/pkg/progress"
+	"github.com/moby/moby/client"
 	"github.com/moby/sys/atomicwriter"
+
+	"github.com/docker/compose/v5/pkg/api"
 )
 
 func (s *composeService) Export(ctx context.Context, projectName string, options api.ExportOptions) error {
-	return progress.RunWithTitle(ctx, func(ctx context.Context) error {
+	return Run(ctx, func(ctx context.Context) error {
 		return s.export(ctx, projectName, options)
-	}, s.stdinfo(), "Exporting")
+	}, "export", s.events)
 }
 
 func (s *composeService) export(ctx context.Context, projectName string, options api.ExportOptions) error {
@@ -43,46 +44,34 @@ func (s *composeService) export(ctx context.Context, projectName string, options
 	}
 
 	if options.Output == "" {
-		if s.dockerCli.Out().IsTerminal() {
+		if s.stdout().IsTerminal() {
 			return fmt.Errorf("output option is required when exporting to terminal")
 		}
 	} else if err := command.ValidateOutputPath(options.Output); err != nil {
 		return fmt.Errorf("failed to export container: %w", err)
 	}
 
-	clnt := s.dockerCli.Client()
-
-	w := progress.ContextWriter(ctx)
-
 	name := getCanonicalContainerName(container)
-	msg := fmt.Sprintf("export %s to %s", name, options.Output)
-
-	w.Event(progress.Event{
-		ID:         name,
-		Text:       msg,
-		Status:     progress.Working,
-		StatusText: "Exporting",
+	s.events.On(api.Resource{
+		ID:     name,
+		Text:   api.StatusExporting,
+		Status: api.Working,
 	})
 
-	responseBody, err := clnt.ContainerExport(ctx, container.ID)
+	responseBody, err := s.apiClient().ContainerExport(ctx, container.ID, client.ContainerExportOptions{})
 	if err != nil {
 		return err
 	}
 
 	defer func() {
 		if err := responseBody.Close(); err != nil {
-			w.Event(progress.Event{
-				ID:         name,
-				Text:       msg,
-				Status:     progress.Error,
-				StatusText: fmt.Sprintf("Failed to close response body: %v", err),
-			})
+			s.events.On(errorEventf(name, "Failed to close response body: %s", err.Error()))
 		}
 	}()
 
 	if !s.dryRun {
 		if options.Output == "" {
-			_, err := io.Copy(s.dockerCli.Out(), responseBody)
+			_, err := io.Copy(s.stdout(), responseBody)
 			return err
 		} else {
 			writer, err := atomicwriter.New(options.Output, 0o600)
@@ -96,11 +85,10 @@ func (s *composeService) export(ctx context.Context, projectName string, options
 		}
 	}
 
-	w.Event(progress.Event{
-		ID:         name,
-		Text:       msg,
-		Status:     progress.Done,
-		StatusText: "Exported",
+	s.events.On(api.Resource{
+		ID:     name,
+		Text:   api.StatusExported,
+		Status: api.Done,
 	})
 
 	return nil

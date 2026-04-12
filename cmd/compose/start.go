@@ -18,17 +18,22 @@ package compose
 
 import (
 	"context"
+	"time"
 
 	"github.com/docker/cli/cli/command"
-	"github.com/docker/compose/v2/pkg/api"
 	"github.com/spf13/cobra"
+
+	"github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/compose"
 )
 
 type startOptions struct {
 	*ProjectOptions
+	wait        bool
+	waitTimeout int
 }
 
-func startCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service) *cobra.Command {
+func startCommand(p *ProjectOptions, dockerCli command.Cli, backendOptions *BackendOptions) *cobra.Command {
 	opts := startOptions{
 		ProjectOptions: p,
 	}
@@ -36,22 +41,37 @@ func startCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service)
 		Use:   "start [SERVICE...]",
 		Short: "Start services",
 		RunE: Adapt(func(ctx context.Context, args []string) error {
-			return runStart(ctx, dockerCli, backend, opts, args)
+			return runStart(ctx, dockerCli, backendOptions, opts, args)
 		}),
 		ValidArgsFunction: completeServiceNames(dockerCli, p),
 	}
+	flags := startCmd.Flags()
+	flags.BoolVar(&opts.wait, "wait", false, "Wait for services to be running|healthy. Implies detached mode.")
+	flags.IntVar(&opts.waitTimeout, "wait-timeout", 0, "Maximum duration in seconds to wait for the project to be running|healthy")
+
 	return startCmd
 }
 
-func runStart(ctx context.Context, dockerCli command.Cli, backend api.Service, opts startOptions, services []string) error {
+func runStart(ctx context.Context, dockerCli command.Cli, backendOptions *BackendOptions, opts startOptions, services []string) error {
 	project, name, err := opts.projectOrName(ctx, dockerCli, services...)
 	if err != nil {
 		return err
 	}
 
+	backend, err := compose.NewComposeService(dockerCli, backendOptions.Options...)
+	if err != nil {
+		return err
+	}
+
+	var timeout time.Duration
+	if opts.waitTimeout > 0 {
+		timeout = time.Duration(opts.waitTimeout) * time.Second
+	}
 	return backend.Start(ctx, name, api.StartOptions{
-		AttachTo: services,
-		Project:  project,
-		Services: services,
+		AttachTo:    services,
+		Project:     project,
+		Services:    services,
+		Wait:        opts.wait,
+		WaitTimeout: timeout,
 	})
 }

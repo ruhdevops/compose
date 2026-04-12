@@ -26,7 +26,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/stretchr/testify/require"
+	"gotest.tools/v3/assert"
 )
 
 func TestDontWatchEachFile(t *testing.T) {
@@ -56,7 +56,7 @@ func TestDontWatchEachFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		f.WriteFile(f.JoinPath(initialDir, fmt.Sprintf("%d", i)), "initial data")
 	}
 
@@ -79,7 +79,7 @@ func TestDontWatchEachFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		f.WriteFile(f.JoinPath(inplaceDir, fmt.Sprintf("%d", i)), "inplace data")
 	}
 
@@ -98,7 +98,7 @@ func TestDontWatchEachFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		f.WriteFile(f.JoinPath(stagedDir, fmt.Sprintf("%d", i)), "staged data")
 	}
 
@@ -113,7 +113,7 @@ func TestDontWatchEachFile(t *testing.T) {
 	f.events = nil
 
 	n, err := inotifyNodes()
-	require.NoError(t, err)
+	assert.NilError(t, err)
 	if n > 10 {
 		t.Fatalf("watching more than 10 files: %d", n)
 	}
@@ -146,13 +146,13 @@ func TestDontRecurseWhenWatchingParentsOfNonExistentFiles(t *testing.T) {
 	f.watch(filepath.Join(watched, ".tiltignore"))
 
 	excludedDir := f.JoinPath(watched, "excluded")
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		f.WriteFile(f.JoinPath(excludedDir, fmt.Sprintf("%d", i), "data.txt"), "initial data")
 	}
 	f.fsync()
 
 	n, err := inotifyNodes()
-	require.NoError(t, err)
+	assert.NilError(t, err)
 	if n > 5 {
 		t.Fatalf("watching more than 5 files: %d", n)
 	}

@@ -23,28 +23,35 @@ import (
 	"github.com/docker/cli/cli-plugins/metadata"
 	"github.com/docker/cli/cli-plugins/plugin"
 	"github.com/docker/cli/cli/command"
-	"github.com/docker/compose/v2/cmd/cmdtrace"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
-	"github.com/docker/compose/v2/cmd/compatibility"
-	commands "github.com/docker/compose/v2/cmd/compose"
-	"github.com/docker/compose/v2/internal"
-	"github.com/docker/compose/v2/pkg/compose"
+	"github.com/docker/compose/v5/cmd/cmdtrace"
+	"github.com/docker/compose/v5/cmd/compatibility"
+	commands "github.com/docker/compose/v5/cmd/compose"
+	"github.com/docker/compose/v5/cmd/prompt"
+	"github.com/docker/compose/v5/internal"
+	"github.com/docker/compose/v5/pkg/compose"
 )
 
 func pluginMain() {
 	plugin.Run(
-		func(dockerCli command.Cli) *cobra.Command {
-			backend := compose.NewComposeService(dockerCli)
-			cmd := commands.RootCommand(dockerCli, backend)
+		func(cli command.Cli) *cobra.Command {
+			backendOptions := &commands.BackendOptions{
+				Options: []compose.Option{
+					compose.WithPrompt(prompt.NewPrompt(cli.In(), cli.Out()).Confirm),
+				},
+			}
+
+			cmd := commands.RootCommand(cli, backendOptions)
+			cmd.AddCommand(commands.HooksCommand())
 			originalPreRunE := cmd.PersistentPreRunE
 			cmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
-				// initialize the dockerCli instance
+				// initialize the cli instance
 				if err := plugin.PersistentPreRunE(cmd, args); err != nil {
 					return err
 				}
-				if err := cmdtrace.Setup(cmd, dockerCli, os.Args[1:]); err != nil {
+				if err := cmdtrace.Setup(cmd, cli, os.Args[1:]); err != nil {
 					logrus.Debugf("failed to enable tracing: %v", err)
 				}
 

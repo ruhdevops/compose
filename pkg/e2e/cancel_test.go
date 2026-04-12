@@ -1,5 +1,4 @@
 //go:build !windows
-// +build !windows
 
 /*
    Copyright 2020 Docker Compose CLI authors
@@ -28,9 +27,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/compose/v2/pkg/utils"
 	"gotest.tools/v3/assert"
 	"gotest.tools/v3/icmd"
+
+	"github.com/docker/compose/v5/pkg/utils"
 )
 
 func TestComposeCancel(t *testing.T) {
@@ -39,7 +39,7 @@ func TestComposeCancel(t *testing.T) {
 	t.Run("metrics on cancel Compose build", func(t *testing.T) {
 		const buildProjectPath = "fixtures/build-infinite/compose.yaml"
 
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(t.Context())
 		defer cancel()
 
 		// require a separate groupID from the process running tests, in order to simulate ctrl+C from a terminal.

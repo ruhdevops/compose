@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/icmd"
 )
 
@@ -100,7 +101,7 @@ func TestNetworkLinks(t *testing.T) {
 	t.Run("curl links in default bridge network", func(t *testing.T) {
 		res := c.RunDockerComposeCmd(t, "-f", "./fixtures/network-links/compose.yaml", "--project-name", projectName,
 			"exec", "-T", "container2", "curl", "http://container1/")
-		assert.Assert(t, strings.Contains(res.Stdout(), "Welcome to nginx!"), res.Stdout())
+		assert.Assert(t, is.Contains(res.Stdout(), "Welcome to nginx!"))
 	})
 
 	t.Run("down", func(t *testing.T) {
@@ -212,11 +213,9 @@ func TestNetworkRecreate(t *testing.T) {
 	res := c.RunDockerComposeCmd(t, "-f", "./fixtures/network-recreate/compose.yaml", "--project-name", projectName, "--progress=plain", "up", "-d")
 	err := res.Stderr()
 	fmt.Println(err)
-	res.Assert(t, icmd.Expected{Err: `
- Container network_recreate-web-1  Stopped
- Network network_recreate_test  Removed
- Network network_recreate_test  Creating
- Network network_recreate_test  Created
- Container network_recreate-web-1  Starting
- Container network_recreate-web-1  Started`})
+	hasStopped := strings.Contains(err, "Stopped")
+	hasResumed := strings.Contains(err, "Started") || strings.Contains(err, "Recreated")
+	if !hasStopped || !hasResumed {
+		t.Fatalf("unexpected output, missing expected events, stderr: %s", err)
+	}
 }

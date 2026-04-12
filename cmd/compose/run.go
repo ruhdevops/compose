@@ -22,23 +22,23 @@ import (
 	"os"
 	"strings"
 
+	composecli "github.com/compose-spec/compose-go/v2/cli"
 	"github.com/compose-spec/compose-go/v2/dotenv"
 	"github.com/compose-spec/compose-go/v2/format"
-	xprogress "github.com/moby/buildkit/util/progress/progressui"
-	"github.com/sirupsen/logrus"
-
-	cgo "github.com/compose-spec/compose-go/v2/cli"
 	"github.com/compose-spec/compose-go/v2/types"
+	"github.com/docker/cli/cli"
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/cli/opts"
 	"github.com/mattn/go-shellwords"
+	xprogress "github.com/moby/buildkit/util/progress/progressui"
+	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
-	"github.com/docker/cli/cli"
-	"github.com/docker/compose/v2/pkg/api"
-	"github.com/docker/compose/v2/pkg/progress"
-	"github.com/docker/compose/v2/pkg/utils"
+	"github.com/docker/compose/v5/cmd/display"
+	"github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/compose"
+	"github.com/docker/compose/v5/pkg/utils"
 )
 
 type runOptions struct {
@@ -142,7 +142,7 @@ func (options runOptions) getEnvironment(resolve func(string) (string, bool)) (t
 	return environment, nil
 }
 
-func runCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service) *cobra.Command {
+func runCommand(p *ProjectOptions, dockerCli command.Cli, backendOptions *BackendOptions) *cobra.Command {
 	options := runOptions{
 		composeOptions: &composeOptions{
 			ProjectOptions: p,
@@ -185,25 +185,26 @@ func runCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service) *
 				}
 			} else if !cmd.Flags().Changed("no-TTY") && !cmd.Flags().Changed("interactive") && !dockerCli.In().IsTerminal() {
 				// while `docker run` requires explicit `-it` flags, Compose enables interactive mode and TTY by default
-				// but when compose is used from a scripr has stdin piped from another command, we just can't
+				// but when compose is used from a script that has stdin piped from another command, we just can't
 				// Here, we detect we run "by default" (user didn't passed explicit flags) and disable TTY allocation if
 				// we don't have an actual terminal to attach to for interactive mode
 				options.noTty = true
 			}
 
 			if options.quiet {
-				progress.Mode = progress.ModeQuiet
-				devnull, err := os.Open(os.DevNull)
-				if err != nil {
-					return err
-				}
-				os.Stdout = devnull
+				display.Mode = display.ModeQuiet
+				backendOptions.Add(compose.WithEventProcessor(display.Quiet()))
 			}
 			createOpts.pullChanged = cmd.Flags().Changed("pull")
 			return nil
 		}),
 		RunE: Adapt(func(ctx context.Context, args []string) error {
-			project, _, err := p.ToProject(ctx, dockerCli, []string{options.Service}, cgo.WithResolvedPaths(true), cgo.WithoutEnvironmentResolution)
+			backend, err := compose.NewComposeService(dockerCli, backendOptions.Options...)
+			if err != nil {
+				return err
+			}
+
+			project, _, err := p.ToProject(ctx, dockerCli, backend, []string{options.Service}, composecli.WithoutEnvironmentResolution)
 			if err != nil {
 				return err
 			}
@@ -266,7 +267,7 @@ func normalizeRunFlags(f *pflag.FlagSet, name string) pflag.NormalizedName {
 	return pflag.NormalizedName(name)
 }
 
-func runRun(ctx context.Context, backend api.Service, project *types.Project, options runOptions, createOpts createOptions, buildOpts buildOptions, dockerCli command.Cli) error {
+func runRun(ctx context.Context, backend api.Compose, project *types.Project, options runOptions, createOpts createOptions, buildOpts buildOptions, dockerCli command.Cli) error {
 	project, err := options.apply(project)
 	if err != nil {
 		return err
@@ -283,11 +284,11 @@ func runRun(ctx context.Context, backend api.Service, project *types.Project, op
 
 	labels := types.Labels{}
 	for _, s := range options.labels {
-		parts := strings.SplitN(s, "=", 2)
-		if len(parts) != 2 {
+		key, val, ok := strings.Cut(s, "=")
+		if !ok {
 			return fmt.Errorf("label must be set as KEY=VALUE")
 		}
-		labels[parts[0]] = parts[1]
+		labels[key] = val
 	}
 
 	var buildForRun *api.BuildOptions

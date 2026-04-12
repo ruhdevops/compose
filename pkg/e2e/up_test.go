@@ -1,5 +1,4 @@
 //go:build !windows
-// +build !windows
 
 /*
    Copyright 2022 Docker Compose CLI authors
@@ -29,10 +28,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/compose/v2/pkg/utils"
-	"github.com/stretchr/testify/require"
 	"gotest.tools/v3/assert"
 	"gotest.tools/v3/icmd"
+
+	"github.com/docker/compose/v5/pkg/utils"
 )
 
 func TestUpServiceUnhealthy(t *testing.T) {
@@ -75,7 +74,7 @@ func TestUpDependenciesNotStopped(t *testing.T) {
 		"app",
 	)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	t.Cleanup(cancel)
 
 	cmd, err := StartWithNewGroupID(ctx, testCmd, upOut, nil)
@@ -87,7 +86,7 @@ func TestUpDependenciesNotStopped(t *testing.T) {
 	RequireServiceState(t, c, "dependency", "running")
 
 	t.Log("Simulating Ctrl-C")
-	require.NoError(t, syscall.Kill(-cmd.Process.Pid, syscall.SIGINT),
+	assert.NilError(t, syscall.Kill(-cmd.Process.Pid, syscall.SIGINT),
 		"Failed to send SIGINT to compose up process")
 
 	t.Log("Waiting for `compose up` to exit")
@@ -98,7 +97,7 @@ func TestUpDependenciesNotStopped(t *testing.T) {
 		if exitErr.ExitCode() == -1 {
 			t.Fatalf("`compose up` was killed: %v", err)
 		}
-		require.Equal(t, 130, exitErr.ExitCode())
+		assert.Equal(t, 130, exitErr.ExitCode())
 	}
 
 	RequireServiceState(t, c, "app", "exited")
@@ -175,8 +174,8 @@ func TestUpWithAllResources(t *testing.T) {
 	})
 
 	res := c.RunDockerComposeCmd(t, "-f", "./fixtures/resources/compose.yaml", "--all-resources", "--project-name", projectName, "up")
-	assert.Assert(t, strings.Contains(res.Combined(), fmt.Sprintf(`Volume %s_my_vol  Created`, projectName)), res.Combined())
-	assert.Assert(t, strings.Contains(res.Combined(), fmt.Sprintf(`Network %s_my_net  Created`, projectName)), res.Combined())
+	assert.Assert(t, strings.Contains(res.Combined(), fmt.Sprintf(`Volume %s_my_vol Created`, projectName)), res.Combined())
+	assert.Assert(t, strings.Contains(res.Combined(), fmt.Sprintf(`Network %s_my_net Created`, projectName)), res.Combined())
 }
 
 func TestUpProfile(t *testing.T) {
@@ -187,9 +186,9 @@ func TestUpProfile(t *testing.T) {
 	})
 
 	res := c.RunDockerComposeCmd(t, "-f", "./fixtures/profiles/docker-compose.yaml", "--project-name", projectName, "up", "foo")
-	assert.Assert(t, strings.Contains(res.Combined(), `Container db_c  Created`), res.Combined())
-	assert.Assert(t, strings.Contains(res.Combined(), `Container foo_c  Created`), res.Combined())
-	assert.Assert(t, !strings.Contains(res.Combined(), `Container bar_c  Created`), res.Combined())
+	assert.Assert(t, strings.Contains(res.Combined(), `Container db_c Created`), res.Combined())
+	assert.Assert(t, strings.Contains(res.Combined(), `Container foo_c Created`), res.Combined())
+	assert.Assert(t, !strings.Contains(res.Combined(), `Container bar_c Created`), res.Combined())
 }
 
 func TestUpImageID(t *testing.T) {
@@ -218,7 +217,7 @@ func TestUpStopWithLogsMixed(t *testing.T) {
 	res := c.RunDockerComposeCmd(t, "-f", "./fixtures/stop/compose.yaml", "--project-name", projectName, "up", "--abort-on-container-exit")
 	// assert we still get service2 logs after service 1 Stopped event
 	res.Assert(t, icmd.Expected{
-		Err: "Container compose-e2e-stop-logs-service1-1  Stopped",
+		Err: "Container compose-e2e-stop-logs-service1-1 Stopped",
 	})
 	// assert we get stop hook logs
 	res.Assert(t, icmd.Expected{Out: "service2-1 ->  | stop hook running...\nservice2-1     | 64 bytes"})

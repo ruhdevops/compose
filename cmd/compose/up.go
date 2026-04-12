@@ -31,10 +31,11 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
-	"github.com/docker/compose/v2/cmd/formatter"
-	"github.com/docker/compose/v2/pkg/api"
-	ui "github.com/docker/compose/v2/pkg/progress"
-	"github.com/docker/compose/v2/pkg/utils"
+	"github.com/docker/compose/v5/cmd/display"
+	"github.com/docker/compose/v5/cmd/formatter"
+	"github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/compose"
+	"github.com/docker/compose/v5/pkg/utils"
 )
 
 // composeOptions hold options common to `up` and `run` to run compose project
@@ -109,7 +110,7 @@ func (opts upOptions) OnExit() api.Cascade {
 	}
 }
 
-func upCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service) *cobra.Command {
+func upCommand(p *ProjectOptions, dockerCli command.Cli, backendOptions *BackendOptions) *cobra.Command {
 	up := upOptions{}
 	create := createOptions{}
 	build := buildOptions{ProjectOptions: p}
@@ -140,7 +141,7 @@ func upCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service) *c
 				return fmt.Errorf("no service selected")
 			}
 
-			return runUp(ctx, dockerCli, backend, create, up, build, project, services)
+			return runUp(ctx, dockerCli, backendOptions, create, up, build, project, services)
 		}),
 		ValidArgsFunction: completeServiceNames(dockerCli, p),
 	}
@@ -187,6 +188,9 @@ func upCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service) *c
 
 //nolint:gocyclo
 func validateFlags(up *upOptions, create *createOptions) error {
+	if up.waitTimeout < 0 {
+		return fmt.Errorf("--wait-timeout must be a non-negative integer")
+	}
 	if up.exitCodeFrom != "" && !up.cascadeFail {
 		up.cascadeStop = true
 	}
@@ -228,7 +232,7 @@ func validateFlags(up *upOptions, create *createOptions) error {
 func runUp(
 	ctx context.Context,
 	dockerCli command.Cli,
-	backend api.Service,
+	backendOptions *BackendOptions,
 	createOptions createOptions,
 	upOptions upOptions,
 	buildOptions buildOptions,
@@ -262,7 +266,7 @@ func runUp(
 		if err != nil {
 			return err
 		}
-		bo.Services = services
+		bo.Services = project.ServiceNames()
 		bo.Deps = !upOptions.noDeps
 		build = &bo
 	}
@@ -277,7 +281,15 @@ func runUp(
 		Inherit:              !createOptions.noInherit,
 		Timeout:              createOptions.GetTimeout(),
 		QuietPull:            createOptions.quietPull,
-		AssumeYes:            createOptions.AssumeYes,
+	}
+
+	if createOptions.AssumeYes {
+		backendOptions.Options = append(backendOptions.Options, compose.WithPrompt(compose.AlwaysOkPrompt()))
+	}
+
+	backend, err := compose.NewComposeService(dockerCli, backendOptions.Options...)
+	if err != nil {
+		return err
 	}
 
 	if upOptions.noStart {
@@ -319,7 +331,10 @@ func runUp(
 		attach = attachSet.Elements()
 	}
 
-	timeout := time.Duration(upOptions.waitTimeout) * time.Second
+	var timeout time.Duration
+	if upOptions.waitTimeout > 0 {
+		timeout = time.Duration(upOptions.waitTimeout) * time.Second
+	}
 	return backend.Up(ctx, project, api.UpOptions{
 		Create: create,
 		Start: api.StartOptions{
@@ -332,7 +347,7 @@ func runUp(
 			WaitTimeout:    timeout,
 			Watch:          upOptions.watch,
 			Services:       services,
-			NavigationMenu: upOptions.navigationMenu && ui.Mode != "plain" && dockerCli.In().IsTerminal(),
+			NavigationMenu: upOptions.navigationMenu && display.Mode != "plain" && dockerCli.In().IsTerminal(),
 		},
 	})
 }

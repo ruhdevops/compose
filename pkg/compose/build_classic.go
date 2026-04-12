@@ -28,21 +28,97 @@ import (
 
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/docker/cli/cli"
-	"github.com/docker/cli/cli/command"
 	"github.com/docker/cli/cli/command/image/build"
-	"github.com/docker/compose/v2/pkg/api"
-	buildtypes "github.com/docker/docker/api/types/build"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/registry"
-	"github.com/docker/docker/pkg/jsonmessage"
-	"github.com/docker/docker/pkg/progress"
-	"github.com/docker/docker/pkg/streamformatter"
 	"github.com/moby/go-archive"
+	buildtypes "github.com/moby/moby/api/types/build"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/jsonstream"
+	"github.com/moby/moby/api/types/registry"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/client/pkg/jsonmessage"
+	"github.com/moby/moby/client/pkg/progress"
+	"github.com/moby/moby/client/pkg/streamformatter"
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
+	"github.com/docker/compose/v5/pkg/api"
 )
 
+func (s *composeService) doBuildClassic(ctx context.Context, project *types.Project, serviceToBuild types.Services, options api.BuildOptions) (map[string]string, error) {
+	imageIDs := map[string]string{}
+
+	// Not using bake, additional_context: service:xx is implemented by building images in dependency order
+	project, err := project.WithServicesTransform(func(serviceName string, service types.ServiceConfig) (types.ServiceConfig, error) {
+		if service.Build != nil {
+			for _, c := range service.Build.AdditionalContexts {
+				if t, found := strings.CutPrefix(c, types.ServicePrefix); found {
+					if service.DependsOn == nil {
+						service.DependsOn = map[string]types.ServiceDependency{}
+					}
+					service.DependsOn[t] = types.ServiceDependency{
+						Condition: "build", // non-canonical, but will force dependency graph ordering
+					}
+				}
+			}
+		}
+		return service, nil
+	})
+	if err != nil {
+		return imageIDs, err
+	}
+
+	// we use a pre-allocated []string to collect build digest by service index while running concurrent goroutines
+	builtDigests := make([]string, len(project.Services))
+	names := project.ServiceNames()
+	getServiceIndex := func(name string) int {
+		for idx, n := range names {
+			if n == name {
+				return idx
+			}
+		}
+		return -1
+	}
+
+	err = InDependencyOrder(ctx, project, func(ctx context.Context, name string) error {
+		trace.SpanFromContext(ctx).SetAttributes(attribute.String("builder", "classic"))
+		service, ok := serviceToBuild[name]
+		if !ok {
+			return nil
+		}
+
+		image := api.GetImageNameOrDefault(service, project.Name)
+		s.events.On(buildingEvent(image))
+		id, err := s.doBuildImage(ctx, project, service, options)
+		if err != nil {
+			return err
+		}
+		s.events.On(builtEvent(image))
+		builtDigests[getServiceIndex(name)] = id
+
+		if options.Push {
+			return s.push(ctx, project, api.PushOptions{})
+		}
+		return nil
+	}, func(traversal *graphTraversal) {
+		traversal.maxConcurrency = s.maxConcurrency
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	for i, imageDigest := range builtDigests {
+		if imageDigest != "" {
+			service := project.Services[names[i]]
+			imageRef := api.GetImageNameOrDefault(service, project.Name)
+			imageIDs[imageRef] = imageDigest
+		}
+	}
+	return imageIDs, err
+}
+
 //nolint:gocyclo
-func (s *composeService) doBuildClassic(ctx context.Context, project *types.Project, service types.ServiceConfig, options api.BuildOptions) (string, error) {
+func (s *composeService) doBuildImage(ctx context.Context, project *types.Project, service types.ServiceConfig, options api.BuildOptions) (string, error) {
 	var (
 		buildCtx      io.ReadCloser
 		dockerfileCtx io.ReadCloser
@@ -175,7 +251,7 @@ func (s *composeService) doBuildClassic(ctx context.Context, project *types.Proj
 			RegistryToken: authConfig.RegistryToken,
 		}
 	}
-	buildOpts := imageBuildOptions(s.dockerCli, project, service, options)
+	buildOpts := imageBuildOptions(s.getProxyConfig(), project, service, options)
 	imageName := api.GetImageNameOrDefault(service, project.Name)
 	buildOpts.Tags = append(buildOpts.Tags, imageName)
 	buildOpts.Dockerfile = relDockerfile
@@ -184,6 +260,7 @@ func (s *composeService) doBuildClassic(ctx context.Context, project *types.Proj
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	s.events.On(buildingEvent(imageName))
 	response, err := s.apiClient().ImageBuild(ctx, body, buildOpts)
 	if err != nil {
 		return "", err
@@ -191,7 +268,7 @@ func (s *composeService) doBuildClassic(ctx context.Context, project *types.Proj
 	defer response.Body.Close() //nolint:errcheck
 
 	imageID := ""
-	aux := func(msg jsonmessage.JSONMessage) {
+	aux := func(msg jsonstream.Message) {
 		var result buildtypes.Result
 		if err := json.Unmarshal(*msg.Aux, &result); err != nil {
 			logrus.Errorf("Failed to parse aux message: %s", err)
@@ -202,7 +279,7 @@ func (s *composeService) doBuildClassic(ctx context.Context, project *types.Proj
 
 	err = jsonmessage.DisplayJSONMessagesStream(response.Body, buildBuff, progBuff.FD(), true, aux)
 	if err != nil {
-		var jerr *jsonmessage.JSONError
+		var jerr *jsonstream.Error
 		if errors.As(err, &jerr) {
 			// If no error code is set, default to 1
 			if jerr.Code == 0 {
@@ -212,18 +289,19 @@ func (s *composeService) doBuildClassic(ctx context.Context, project *types.Proj
 		}
 		return "", err
 	}
+	s.events.On(builtEvent(imageName))
 	return imageID, nil
 }
 
-func imageBuildOptions(dockerCli command.Cli, project *types.Project, service types.ServiceConfig, options api.BuildOptions) buildtypes.ImageBuildOptions {
+func imageBuildOptions(proxyConfigs map[string]string, project *types.Project, service types.ServiceConfig, options api.BuildOptions) client.ImageBuildOptions {
 	config := service.Build
-	return buildtypes.ImageBuildOptions{
+	return client.ImageBuildOptions{
 		Version:     buildtypes.BuilderV1,
 		Tags:        config.Tags,
 		NoCache:     config.NoCache,
 		Remove:      true,
 		PullParent:  config.Pull,
-		BuildArgs:   resolveAndMergeBuildArgs(dockerCli, project, service, options),
+		BuildArgs:   resolveAndMergeBuildArgs(proxyConfigs, project, service, options),
 		Labels:      config.Labels,
 		NetworkMode: config.Network,
 		ExtraHosts:  config.ExtraHosts.AsList(":"),

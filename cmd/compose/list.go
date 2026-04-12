@@ -18,17 +18,20 @@ package compose
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 
 	"github.com/docker/cli/cli/command"
-	"github.com/docker/compose/v2/cmd/formatter"
-
 	"github.com/docker/cli/opts"
+	"github.com/moby/moby/client"
 	"github.com/spf13/cobra"
 
-	"github.com/docker/compose/v2/pkg/api"
+	"github.com/docker/compose/v5/cmd/formatter"
+	"github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/compose"
 )
 
 type lsOptions struct {
@@ -38,13 +41,13 @@ type lsOptions struct {
 	Filter opts.FilterOpt
 }
 
-func listCommand(dockerCli command.Cli, backend api.Service) *cobra.Command {
+func listCommand(dockerCli command.Cli, backendOptions *BackendOptions) *cobra.Command {
 	lsOpts := lsOptions{Filter: opts.NewFilterOpt()}
 	lsCmd := &cobra.Command{
 		Use:   "ls [OPTIONS]",
 		Short: "List running compose projects",
 		RunE: Adapt(func(ctx context.Context, args []string) error {
-			return runList(ctx, dockerCli, backend, lsOpts)
+			return runList(ctx, dockerCli, backendOptions, lsOpts)
 		}),
 		Args:              cobra.NoArgs,
 		ValidArgsFunction: noCompletion(),
@@ -61,25 +64,49 @@ var acceptedListFilters = map[string]bool{
 	"name": true,
 }
 
-func runList(ctx context.Context, dockerCli command.Cli, backend api.Service, lsOpts lsOptions) error {
+// match returns true if any of the values at key match the source string
+func match(filters client.Filters, field, source string) bool {
+	if f, ok := filters[field]; ok && f[source] {
+		return true
+	}
+
+	fieldValues := filters[field]
+	for name2match := range fieldValues {
+		isMatch, err := regexp.MatchString(name2match, source)
+		if err != nil {
+			continue
+		}
+		if isMatch {
+			return true
+		}
+	}
+	return false
+}
+
+func runList(ctx context.Context, dockerCli command.Cli, backendOptions *BackendOptions, lsOpts lsOptions) error {
 	filters := lsOpts.Filter.Value()
-	err := filters.Validate(acceptedListFilters)
+
+	for filter := range filters {
+		if _, ok := acceptedListFilters[filter]; !ok {
+			return errors.New("invalid filter '" + filter + "'")
+		}
+	}
+
+	backend, err := compose.NewComposeService(dockerCli, backendOptions.Options...)
 	if err != nil {
 		return err
 	}
-
 	stackList, err := backend.List(ctx, api.ListOptions{All: lsOpts.All})
 	if err != nil {
 		return err
 	}
 
-	if filters.Len() > 0 {
+	if len(filters) > 0 {
 		var filtered []api.Stack
 		for _, s := range stackList {
-			if filters.Contains("name") && !filters.Match("name", s.Name) {
-				continue
+			if match(filters, "name", s.Name) {
+				filtered = append(filtered, s)
 			}
-			filtered = append(filtered, s)
 		}
 		stackList = filtered
 	}

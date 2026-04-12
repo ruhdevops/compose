@@ -29,9 +29,11 @@ import (
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/containerd/errdefs"
 	"github.com/docker/cli/cli-plugins/manager"
-	"github.com/docker/compose/v2/pkg/progress"
+	"github.com/moby/moby/client/pkg/versions"
 	"github.com/spf13/cobra"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/docker/compose/v5/pkg/api"
 )
 
 func (s *composeService) ensureModels(ctx context.Context, project *types.Project, quietPull bool) error {
@@ -39,31 +41,30 @@ func (s *composeService) ensureModels(ctx context.Context, project *types.Projec
 		return nil
 	}
 
-	api, err := s.newModelAPI(project)
+	mdlAPI, err := s.newModelAPI(project)
 	if err != nil {
 		return err
 	}
-	defer api.Close()
-	availableModels, err := api.ListModels(ctx)
+	defer mdlAPI.Close()
+	availableModels, err := mdlAPI.ListModels(ctx)
 
 	eg, ctx := errgroup.WithContext(ctx)
 	eg.Go(func() error {
-		return api.SetModelVariables(ctx, project)
+		return mdlAPI.SetModelVariables(ctx, project)
 	})
 
-	w := progress.ContextWriter(ctx)
 	for name, config := range project.Models {
 		if config.Name == "" {
 			config.Name = name
 		}
 		eg.Go(func() error {
 			if !slices.Contains(availableModels, config.Model) {
-				err = api.PullModel(ctx, config, quietPull, w)
+				err = mdlAPI.PullModel(ctx, config, quietPull, s.events)
 				if err != nil {
 					return err
 				}
 			}
-			return api.ConfigureModel(ctx, config, w)
+			return mdlAPI.ConfigureModel(ctx, config, s.events)
 		})
 	}
 	return eg.Wait()
@@ -74,6 +75,7 @@ type modelAPI struct {
 	env     []string
 	prepare func(ctx context.Context, cmd *exec.Cmd) error
 	cleanup func()
+	version string
 }
 
 func (s *composeService) newModelAPI(project *types.Project) (*modelAPI, error) {
@@ -84,12 +86,16 @@ func (s *composeService) newModelAPI(project *types.Project) (*modelAPI, error) 
 		}
 		return nil, err
 	}
+	if dockerModel.Err != nil {
+		return nil, fmt.Errorf("failed to load Docker Model plugin: %w", dockerModel.Err)
+	}
 	endpoint, cleanup, err := s.propagateDockerEndpoint()
 	if err != nil {
 		return nil, err
 	}
 	return &modelAPI{
-		path: dockerModel.Path,
+		path:    dockerModel.Path,
+		version: dockerModel.Version,
 		prepare: func(ctx context.Context, cmd *exec.Cmd) error {
 			return s.prepareShellOut(ctx, project.Environment, cmd)
 		},
@@ -102,11 +108,11 @@ func (m *modelAPI) Close() {
 	m.cleanup()
 }
 
-func (m *modelAPI) PullModel(ctx context.Context, model types.ModelConfig, quietPull bool, w progress.Writer) error {
-	w.Event(progress.Event{
+func (m *modelAPI) PullModel(ctx context.Context, model types.ModelConfig, quietPull bool, events api.EventProcessor) error {
+	events.On(api.Resource{
 		ID:     model.Name,
-		Status: progress.Working,
-		Text:   "Pulling",
+		Status: api.Working,
+		Text:   api.StatusPulling,
 	})
 
 	cmd := exec.CommandContext(ctx, m.path, "pull", model.Model)
@@ -132,32 +138,31 @@ func (m *modelAPI) PullModel(ctx context.Context, model types.ModelConfig, quiet
 		}
 
 		if !quietPull {
-			w.Event(progress.Event{
-				ID:         model.Name,
-				Status:     progress.Working,
-				Text:       "Pulling",
-				StatusText: msg,
+			events.On(api.Resource{
+				ID:     model.Name,
+				Status: api.Working,
+				Text:   api.StatusPulling,
 			})
 		}
 	}
 
 	err = cmd.Wait()
 	if err != nil {
-		w.Event(progress.ErrorMessageEvent(model.Name, err.Error()))
+		events.On(errorEvent(model.Name, err.Error()))
 	}
-	w.Event(progress.Event{
+	events.On(api.Resource{
 		ID:     model.Name,
-		Status: progress.Working,
-		Text:   "Pulled",
+		Status: api.Working,
+		Text:   api.StatusPulled,
 	})
 	return err
 }
 
-func (m *modelAPI) ConfigureModel(ctx context.Context, config types.ModelConfig, w progress.Writer) error {
-	w.Event(progress.Event{
+func (m *modelAPI) ConfigureModel(ctx context.Context, config types.ModelConfig, events api.EventProcessor) error {
+	events.On(api.Resource{
 		ID:     config.Name,
-		Status: progress.Working,
-		Text:   "Configuring",
+		Status: api.Working,
+		Text:   api.StatusConfiguring,
 	})
 	// configure [--context-size=<n>] MODEL [-- <runtime-flags...>]
 	args := []string{"configure"}
@@ -165,7 +170,8 @@ func (m *modelAPI) ConfigureModel(ctx context.Context, config types.ModelConfig,
 		args = append(args, "--context-size", strconv.Itoa(config.ContextSize))
 	}
 	args = append(args, config.Model)
-	if len(config.RuntimeFlags) != 0 {
+	// Only append RuntimeFlags if docker model CLI version is >= v1.0.6
+	if len(config.RuntimeFlags) != 0 && m.supportsRuntimeFlags() {
 		args = append(args, "--")
 		args = append(args, config.RuntimeFlags...)
 	}
@@ -174,7 +180,17 @@ func (m *modelAPI) ConfigureModel(ctx context.Context, config types.ModelConfig,
 	if err != nil {
 		return err
 	}
-	return cmd.Run()
+	err = cmd.Run()
+	if err != nil {
+		events.On(errorEvent(config.Name, err.Error()))
+		return err
+	}
+	events.On(api.Resource{
+		ID:     config.Name,
+		Status: api.Done,
+		Text:   api.StatusConfigured,
+	})
+	return nil
 }
 
 func (m *modelAPI) SetModelVariables(ctx context.Context, project *types.Project) error {
@@ -262,4 +278,17 @@ func (m *modelAPI) ListModels(ctx context.Context) ([]string, error) {
 		availableModels = append(availableModels, model.Tags...)
 	}
 	return availableModels, nil
+}
+
+// supportsRuntimeFlags checks if the docker model version supports runtime flags
+// Runtime flags are supported in version >= v1.0.6
+func (m *modelAPI) supportsRuntimeFlags() bool {
+	// If version is not cached, don't append runtime flags to be safe
+	if m.version == "" {
+		return false
+	}
+
+	// Strip 'v' prefix if present (e.g., "v1.0.6" -> "1.0.6")
+	versionStr := strings.TrimPrefix(m.version, "v")
+	return !versions.LessThan(versionStr, "1.0.6")
 }

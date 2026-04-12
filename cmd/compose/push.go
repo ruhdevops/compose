@@ -23,7 +23,8 @@ import (
 	"github.com/docker/cli/cli/command"
 	"github.com/spf13/cobra"
 
-	"github.com/docker/compose/v2/pkg/api"
+	"github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/compose"
 )
 
 type pushOptions struct {
@@ -34,7 +35,7 @@ type pushOptions struct {
 	Quiet          bool
 }
 
-func pushCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service) *cobra.Command {
+func pushCommand(p *ProjectOptions, dockerCli command.Cli, backendOptions *BackendOptions) *cobra.Command {
 	opts := pushOptions{
 		ProjectOptions: p,
 	}
@@ -42,7 +43,7 @@ func pushCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service) 
 		Use:   "push [OPTIONS] [SERVICE...]",
 		Short: "Push service images",
 		RunE: Adapt(func(ctx context.Context, args []string) error {
-			return runPush(ctx, dockerCli, backend, opts, args)
+			return runPush(ctx, dockerCli, backendOptions, opts, args)
 		}),
 		ValidArgsFunction: completeServiceNames(dockerCli, p),
 	}
@@ -53,8 +54,13 @@ func pushCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service) 
 	return pushCmd
 }
 
-func runPush(ctx context.Context, dockerCli command.Cli, backend api.Service, opts pushOptions, services []string) error {
-	project, _, err := opts.ToProject(ctx, dockerCli, services)
+func runPush(ctx context.Context, dockerCli command.Cli, backendOptions *BackendOptions, opts pushOptions, services []string) error {
+	backend, err := compose.NewComposeService(dockerCli, backendOptions.Options...)
+	if err != nil {
+		return err
+	}
+
+	project, _, err := opts.ToProject(ctx, dockerCli, backend, services)
 	if err != nil {
 		return err
 	}

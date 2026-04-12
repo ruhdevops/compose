@@ -1,5 +1,4 @@
-//go:build !darwin
-// +build !darwin
+//go:build !fsnotify
 
 /*
    Copyright 2020 Docker Compose CLI authors
@@ -27,9 +26,10 @@ import (
 	"runtime"
 	"strings"
 
-	pathutil "github.com/docker/compose/v2/internal/paths"
 	"github.com/sirupsen/logrus"
 	"github.com/tilt-dev/fsnotify"
+
+	pathutil "github.com/docker/compose/v5/internal/paths"
 )
 
 // A naive file watcher that uses the plain fsnotify API.

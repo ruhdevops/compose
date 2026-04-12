@@ -27,11 +27,11 @@ import (
 func Test_BatchDebounceEvents(t *testing.T) {
 	ch := make(chan FileEvent)
 	clock := clockwork.NewFakeClock()
-	ctx, stop := context.WithCancel(context.Background())
+	ctx, stop := context.WithCancel(t.Context())
 	t.Cleanup(stop)
 
 	eventBatchCh := BatchDebounceEvents(ctx, clock, ch)
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		path := "/a"
 		if i%2 == 0 {
 			path = "/b"

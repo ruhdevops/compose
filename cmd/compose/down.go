@@ -23,12 +23,13 @@ import (
 	"time"
 
 	"github.com/docker/cli/cli/command"
-	"github.com/docker/compose/v2/pkg/utils"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
-	"github.com/docker/compose/v2/pkg/api"
+	"github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/compose"
+	"github.com/docker/compose/v5/pkg/utils"
 )
 
 type downOptions struct {
@@ -40,7 +41,7 @@ type downOptions struct {
 	images        string
 }
 
-func downCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service) *cobra.Command {
+func downCommand(p *ProjectOptions, dockerCli command.Cli, backendOptions *BackendOptions) *cobra.Command {
 	opts := downOptions{
 		ProjectOptions: p,
 	}
@@ -57,9 +58,9 @@ func downCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service) 
 			return nil
 		}),
 		RunE: Adapt(func(ctx context.Context, args []string) error {
-			return runDown(ctx, dockerCli, backend, opts, args)
+			return runDown(ctx, dockerCli, backendOptions, opts, args)
 		}),
-		ValidArgsFunction: noCompletion(),
+		ValidArgsFunction: completeServiceNames(dockerCli, p),
 	}
 	flags := downCmd.Flags()
 	removeOrphans := utils.StringToBool(os.Getenv(ComposeRemoveOrphans))
@@ -77,7 +78,7 @@ func downCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service) 
 	return downCmd
 }
 
-func runDown(ctx context.Context, dockerCli command.Cli, backend api.Service, opts downOptions, services []string) error {
+func runDown(ctx context.Context, dockerCli command.Cli, backendOptions *BackendOptions, opts downOptions, services []string) error {
 	project, name, err := opts.projectOrName(ctx, dockerCli, services...)
 	if err != nil {
 		return err
@@ -87,6 +88,10 @@ func runDown(ctx context.Context, dockerCli command.Cli, backend api.Service, op
 	if opts.timeChanged {
 		timeoutValue := time.Duration(opts.timeout) * time.Second
 		timeout = &timeoutValue
+	}
+	backend, err := compose.NewComposeService(dockerCli, backendOptions.Options...)
+	if err != nil {
+		return err
 	}
 	return backend.Down(ctx, name, api.DownOptions{
 		RemoveOrphans: opts.removeOrphans,

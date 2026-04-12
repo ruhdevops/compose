@@ -20,7 +20,6 @@ import (
 	"strings"
 	"testing"
 
-	testify "github.com/stretchr/testify/assert"
 	"gotest.tools/v3/assert"
 	"gotest.tools/v3/icmd"
 )
@@ -169,8 +168,8 @@ func TestScaleDownRemovesObsolete(t *testing.T) {
 
 func checkServiceContainer(t *testing.T, stdout, containerName, containerState string, count int) {
 	found := 0
-	lines := strings.Split(stdout, "\n")
-	for _, line := range lines {
+	lines := strings.SplitSeq(stdout, "\n")
+	for line := range lines {
 		if strings.Contains(line, containerName) && strings.Contains(line, containerState) {
 			found++
 		}
@@ -182,7 +181,7 @@ func checkServiceContainer(t *testing.T, stdout, containerName, containerState s
 	if containerState != "" {
 		errMessage += fmt.Sprintf(" with expected state %s", containerState)
 	}
-	testify.Fail(t, errMessage, stdout)
+	t.Fatalf("%s\n%s", errMessage, stdout)
 }
 
 func TestScaleDownNoRecreate(t *testing.T) {

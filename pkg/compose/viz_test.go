@@ -17,17 +17,16 @@
 package compose
 
 import (
-	"context"
 	"strconv"
 	"testing"
 
 	"github.com/compose-spec/compose-go/v2/types"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
+	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 
-	compose "github.com/docker/compose/v2/pkg/api"
-	"github.com/docker/compose/v2/pkg/mocks"
+	compose "github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/mocks"
 )
 
 func TestViz(t *testing.T) {
@@ -116,37 +115,34 @@ func TestViz(t *testing.T) {
 	mockCtrl := gomock.NewController(t)
 	defer mockCtrl.Finish()
 	cli := mocks.NewMockCli(mockCtrl)
-	tested := composeService{
-		dockerCli: cli,
-	}
-
-	ctx := context.Background()
+	tested, err := NewComposeService(cli)
+	assert.NilError(t, err)
 
 	t.Run("viz (no ports, networks or image)", func(t *testing.T) {
-		graphStr, err := tested.Viz(ctx, &project, compose.VizOptions{
+		graphStr, err := tested.Viz(t.Context(), &project, compose.VizOptions{
 			Indentation:      "  ",
 			IncludePorts:     false,
 			IncludeImageName: false,
 			IncludeNetworks:  false,
 		})
-		require.NoError(t, err, "viz command failed")
+		assert.NilError(t, err, "viz command failed")
 
 		// check indentation
-		assert.Contains(t, graphStr, "\n  ", graphStr)
-		assert.NotContains(t, graphStr, "\n   ", graphStr)
+		assert.Check(t, is.Contains(graphStr, "\n  "))
+		assert.Check(t, !is.Contains(graphStr, "\n   ")().Success(), graphStr)
 
 		// check digraph name
-		assert.Contains(t, graphStr, "digraph \""+project.Name+"\"", graphStr)
+		assert.Check(t, is.Contains(graphStr, "digraph \""+project.Name+"\""))
 
 		// check nodes
 		for _, service := range project.Services {
-			assert.Contains(t, graphStr, "\""+service.Name+"\" [style=\"filled\"", graphStr)
+			assert.Check(t, is.Contains(graphStr, "\""+service.Name+"\" [style=\"filled\""))
 		}
 
 		// check node attributes
-		assert.NotContains(t, graphStr, "Networks", graphStr)
-		assert.NotContains(t, graphStr, "Image", graphStr)
-		assert.NotContains(t, graphStr, "Ports", graphStr)
+		assert.Check(t, !is.Contains(graphStr, "Networks")().Success())
+		assert.Check(t, !is.Contains(graphStr, "Image")().Success())
+		assert.Check(t, !is.Contains(graphStr, "Ports")().Success())
 
 		// check edges that SHOULD exist in the generated graph
 		allowedEdges := make(map[string][]string)
@@ -159,7 +155,7 @@ func TestViz(t *testing.T) {
 		}
 		for serviceName, dependencies := range allowedEdges {
 			for _, dependencyName := range dependencies {
-				assert.Contains(t, graphStr, "\""+serviceName+"\" -> \""+dependencyName+"\"", graphStr)
+				assert.Check(t, is.Contains(graphStr, "\""+serviceName+"\" -> \""+dependencyName+"\""))
 			}
 		}
 
@@ -176,44 +172,45 @@ func TestViz(t *testing.T) {
 		}
 		for serviceName, forbiddenDeps := range forbiddenEdges {
 			for _, forbiddenDep := range forbiddenDeps {
-				assert.NotContains(t, graphStr, "\""+serviceName+"\" -> \""+forbiddenDep+"\"")
+				assert.Check(t, !is.Contains(graphStr, "\""+serviceName+"\" -> \""+forbiddenDep+"\"")().Success())
 			}
 		}
 	})
 
 	t.Run("viz (with ports, networks and image)", func(t *testing.T) {
-		graphStr, err := tested.Viz(ctx, &project, compose.VizOptions{
+		graphStr, err := tested.Viz(t.Context(), &project, compose.VizOptions{
 			Indentation:      "\t",
 			IncludePorts:     true,
 			IncludeImageName: true,
 			IncludeNetworks:  true,
 		})
-		require.NoError(t, err, "viz command failed")
+		assert.NilError(t, err, "viz command failed")
 
 		// check indentation
-		assert.Contains(t, graphStr, "\n\t", graphStr)
-		assert.NotContains(t, graphStr, "\n\t\t", graphStr)
+		assert.Check(t, is.Contains(graphStr, "\n\t"))
+		assert.Check(t, !is.Contains(graphStr, "\n\t\t")().Success(), graphStr)
 
 		// check digraph name
-		assert.Contains(t, graphStr, "digraph \""+project.Name+"\"", graphStr)
+		assert.Check(t, is.Contains(graphStr, "digraph \""+project.Name+"\""))
 
 		// check nodes
 		for _, service := range project.Services {
-			assert.Contains(t, graphStr, "\""+service.Name+"\" [style=\"filled\"", graphStr)
+			assert.Check(t, is.Contains(graphStr, "\""+service.Name+"\" [style=\"filled\""))
 		}
 
 		// check node attributes
-		assert.Contains(t, graphStr, "Networks", graphStr)
-		assert.Contains(t, graphStr, ">internal<", graphStr)
-		assert.Contains(t, graphStr, ">external<", graphStr)
-		assert.Contains(t, graphStr, "Image", graphStr)
+		assert.Check(t, is.Contains(graphStr, "Networks"))
+		assert.Check(t, is.Contains(graphStr, ">internal<"))
+		assert.Check(t, is.Contains(graphStr, ">external<"))
+		assert.Check(t, is.Contains(graphStr, "Image"))
 		for _, service := range project.Services {
-			assert.Contains(t, graphStr, ">"+service.Image+"<", graphStr)
+			assert.Check(t, is.Contains(graphStr, ">"+service.Image+"<"))
 		}
-		assert.Contains(t, graphStr, "Ports", graphStr)
+		assert.Check(t, is.Contains(graphStr, "Ports"))
 		for _, service := range project.Services {
 			for _, portConfig := range service.Ports {
-				assert.NotContains(t, graphStr, ">"+portConfig.Published+":"+strconv.Itoa(int(portConfig.Target))+"<", graphStr)
+				notContains := !is.Contains(graphStr, ">"+portConfig.Published+":"+strconv.Itoa(int(portConfig.Target))+"<")().Success()
+				assert.Check(t, notContains, graphStr)
 			}
 		}
 	})

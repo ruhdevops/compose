@@ -22,8 +22,10 @@ import (
 
 	"github.com/docker/cli/cli"
 	"github.com/docker/cli/cli/command"
-	"github.com/docker/compose/v2/pkg/api"
 	"github.com/spf13/cobra"
+
+	"github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/compose"
 )
 
 type waitOptions struct {
@@ -34,7 +36,7 @@ type waitOptions struct {
 	downProject bool
 }
 
-func waitCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service) *cobra.Command {
+func waitCommand(p *ProjectOptions, dockerCli command.Cli, backendOptions *BackendOptions) *cobra.Command {
 	opts := waitOptions{
 		ProjectOptions: p,
 	}
@@ -47,7 +49,7 @@ func waitCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service) 
 		Args:  cli.RequiresMinArgs(1),
 		RunE: Adapt(func(ctx context.Context, services []string) error {
 			opts.services = services
-			statusCode, err = runWait(ctx, dockerCli, backend, &opts)
+			statusCode, err = runWait(ctx, dockerCli, backendOptions, &opts)
 			return err
 		}),
 		PostRun: func(cmd *cobra.Command, args []string) {
@@ -60,12 +62,16 @@ func waitCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service) 
 	return cmd
 }
 
-func runWait(ctx context.Context, dockerCli command.Cli, backend api.Service, opts *waitOptions) (int64, error) {
+func runWait(ctx context.Context, dockerCli command.Cli, backendOptions *BackendOptions, opts *waitOptions) (int64, error) {
 	_, name, err := opts.projectOrName(ctx, dockerCli)
 	if err != nil {
 		return 0, err
 	}
 
+	backend, err := compose.NewComposeService(dockerCli, backendOptions.Options...)
+	if err != nil {
+		return 0, err
+	}
 	return backend.Wait(ctx, name, api.WaitOptions{
 		Services:                   opts.services,
 		DownProjectOnContainerExit: opts.downProject,

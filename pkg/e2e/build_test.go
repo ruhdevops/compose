@@ -27,14 +27,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/require"
 	"gotest.tools/v3/assert"
+	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/icmd"
 	"gotest.tools/v3/poll"
 )
 
 func TestLocalComposeBuild(t *testing.T) {
-	for _, env := range []string{"DOCKER_BUILDKIT=0", "DOCKER_BUILDKIT=1,COMPOSE_BAKE=0", "DOCKER_BUILDKIT=1,COMPOSE_BAKE=1"} {
+	for _, env := range []string{"DOCKER_BUILDKIT=0", "DOCKER_BUILDKIT=1"} {
 		c := NewCLI(t, WithEnv(strings.Split(env, ",")...))
 
 		t.Run(env+" build named and unnamed images", func(t *testing.T) {
@@ -244,7 +244,7 @@ func TestBuildImageDependencies(t *testing.T) {
 			cli.RunDockerComposeCmd(t, "down", "--rmi=all", "-t=0")
 			res := cli.RunDockerOrExitError(t, "image", "rm", "build-dependencies-service")
 			if res.Error != nil {
-				require.Contains(t, res.Stderr(), `No such image: build-dependencies-service`)
+				assert.Assert(t, is.Contains(res.Stderr(), `No such image: build-dependencies-service`))
 			}
 		}
 		resetState()
@@ -282,25 +282,6 @@ func TestBuildImageDependencies(t *testing.T) {
 		))
 		doTest(t, cli, "build")
 		doTest(t, cli, "build", "--with-dependencies", "service")
-	})
-
-	t.Run("BuildKit by dependency order", func(t *testing.T) {
-		cli := NewCLI(t, WithEnv(
-			"DOCKER_BUILDKIT=1", "COMPOSE_BAKE=0",
-			"COMPOSE_FILE=./fixtures/build-dependencies/classic.yaml",
-		))
-		doTest(t, cli, "build")
-		doTest(t, cli, "build", "--with-dependencies", "service")
-	})
-
-	t.Run("BuildKit by additional contexts", func(t *testing.T) {
-		cli := NewCLI(t, WithEnv(
-			"DOCKER_BUILDKIT=1", "COMPOSE_BAKE=0",
-			"COMPOSE_FILE=./fixtures/build-dependencies/compose.yaml",
-		))
-		doTest(t, cli, "build")
-		doTest(t, cli, "build", "service")
-		doTest(t, cli, "up", "--build", "service")
 	})
 
 	t.Run("Bake by additional contexts", func(t *testing.T) {
@@ -536,7 +517,7 @@ func TestBuildDependsOn(t *testing.T) {
 
 	res := c.RunDockerComposeCmd(t, "-f", "fixtures/build-dependencies/compose-depends_on.yaml", "--progress=plain", "up", "test2")
 	out := res.Combined()
-	assert.Check(t, strings.Contains(out, "test1  Built"))
+	assert.Check(t, strings.Contains(out, "test1 Built"))
 }
 
 func TestBuildSubset(t *testing.T) {
@@ -548,7 +529,7 @@ func TestBuildSubset(t *testing.T) {
 
 	res := c.RunDockerComposeCmd(t, "-f", "fixtures/build-test/subset/compose.yaml", "build", "main")
 	out := res.Combined()
-	assert.Check(t, strings.Contains(out, "main  Built"))
+	assert.Check(t, strings.Contains(out, "main Built"))
 }
 
 func TestBuildDependentImage(t *testing.T) {
@@ -560,11 +541,11 @@ func TestBuildDependentImage(t *testing.T) {
 
 	res := c.RunDockerComposeCmd(t, "-f", "fixtures/build-test/dependencies/compose.yaml", "build", "firstbuild")
 	out := res.Combined()
-	assert.Check(t, strings.Contains(out, "firstbuild  Built"))
+	assert.Check(t, strings.Contains(out, "firstbuild Built"))
 
 	res = c.RunDockerComposeCmd(t, "-f", "fixtures/build-test/dependencies/compose.yaml", "build", "secondbuild")
 	out = res.Combined()
-	assert.Check(t, strings.Contains(out, "secondbuild  Built"))
+	assert.Check(t, strings.Contains(out, "secondbuild Built"))
 }
 
 func TestBuildSubDependencies(t *testing.T) {
@@ -576,11 +557,11 @@ func TestBuildSubDependencies(t *testing.T) {
 
 	res := c.RunDockerComposeCmd(t, "-f", "fixtures/build-test/sub-dependencies/compose.yaml", "build", "main")
 	out := res.Combined()
-	assert.Check(t, strings.Contains(out, "main  Built"))
+	assert.Check(t, strings.Contains(out, "main Built"))
 
 	res = c.RunDockerComposeCmd(t, "-f", "fixtures/build-test/sub-dependencies/compose.yaml", "up", "--build", "main")
 	out = res.Combined()
-	assert.Check(t, strings.Contains(out, "main  Built"))
+	assert.Check(t, strings.Contains(out, "main Built"))
 }
 
 func TestBuildLongOutputLine(t *testing.T) {
@@ -592,11 +573,11 @@ func TestBuildLongOutputLine(t *testing.T) {
 
 	res := c.RunDockerComposeCmd(t, "-f", "fixtures/build-test/long-output-line/compose.yaml", "build", "long-line")
 	out := res.Combined()
-	assert.Check(t, strings.Contains(out, "long-line  Built"))
+	assert.Check(t, strings.Contains(out, "long-line Built"))
 
 	res = c.RunDockerComposeCmd(t, "-f", "fixtures/build-test/long-output-line/compose.yaml", "up", "--build", "long-line")
 	out = res.Combined()
-	assert.Check(t, strings.Contains(out, "long-line  Built"))
+	assert.Check(t, strings.Contains(out, "long-line Built"))
 }
 
 func TestBuildDependentImageWithProfile(t *testing.T) {
@@ -608,7 +589,7 @@ func TestBuildDependentImageWithProfile(t *testing.T) {
 
 	res := c.RunDockerComposeCmd(t, "-f", "fixtures/build-test/profiles/compose.yaml", "build", "secret-build-test")
 	out := res.Combined()
-	assert.Check(t, strings.Contains(out, "secret-build-test  Built"))
+	assert.Check(t, strings.Contains(out, "secret-build-test Built"))
 }
 
 func TestBuildTLS(t *testing.T) {
@@ -623,7 +604,7 @@ func TestBuildTLS(t *testing.T) {
 		c.RunDockerCmd(t, "context", "rm", dindBuilder)
 	})
 
-	c.RunDockerCmd(t, "run", "--name", dindBuilder, "--privileged", "-p", "2376:2376", "-d", "docker:dind")
+	c.RunDockerCmd(t, "run", "--name", dindBuilder, "--privileged", "-p", "127.0.0.1::2376", "-d", "docker:dind")
 
 	poll.WaitOn(t, func(_ poll.LogT) poll.Result {
 		res := c.RunDockerCmd(t, "logs", dindBuilder)
@@ -636,13 +617,19 @@ func TestBuildTLS(t *testing.T) {
 	time.Sleep(1 * time.Second) // wait for dind setup
 	c.RunDockerCmd(t, "cp", dindBuilder+":/certs/client", tmp)
 
+	res := c.RunDockerCmd(t, "inspect", "-f", "{{(index (index .NetworkSettings.Ports \"2376/tcp\") 0).HostPort}}", dindBuilder)
+	hostPort := strings.TrimSpace(res.Stdout())
+	if hostPort == "" {
+		t.Fatal("failed to resolve mapped host port for 2376/tcp")
+	}
+
 	c.RunDockerCmd(t, "context", "create", dindBuilder, "--docker",
-		fmt.Sprintf("host=tcp://localhost:2376,ca=%s/client/ca.pem,cert=%s/client/cert.pem,key=%s/client/key.pem,skip-tls-verify=1", tmp, tmp, tmp))
+		fmt.Sprintf("host=tcp://127.0.0.1:%s,ca=%s/client/ca.pem,cert=%s/client/cert.pem,key=%s/client/key.pem,skip-tls-verify=1", hostPort, tmp, tmp, tmp))
 
 	cmd := c.NewDockerComposeCmd(t, "-f", "fixtures/build-test/minimal/compose.yaml", "build")
 	cmd.Env = append(cmd.Env, "DOCKER_CONTEXT="+dindBuilder)
 	cmd.Stdout = os.Stdout
-	res := icmd.RunCmd(cmd)
+	res = icmd.RunCmd(cmd)
 	res.Assert(t, icmd.Expected{Err: "Built"})
 }
 

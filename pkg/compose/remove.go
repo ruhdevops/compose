@@ -21,12 +21,11 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/docker/compose/v2/pkg/api"
-	"github.com/docker/docker/api/types/container"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/docker/compose/v2/pkg/progress"
-	"github.com/docker/compose/v2/pkg/prompt"
+	"github.com/docker/compose/v5/pkg/api"
 )
 
 func (s *composeService) Remove(ctx context.Context, projectName string, options api.RemoveOptions) error {
@@ -58,7 +57,7 @@ func (s *composeService) Remove(ctx context.Context, projectName string, options
 	var stoppedContainers Containers
 	for _, ctr := range containers {
 		// We have to inspect containers, as State reported by getContainers suffers a race condition
-		inspected, err := s.apiClient().ContainerInspect(ctx, ctr.ID)
+		inspected, err := s.apiClient().ContainerInspect(ctx, ctr.ID, client.ContainerInspectOptions{})
 		if api.IsNotFoundError(err) {
 			// Already removed. Maybe configured with auto-remove
 			continue
@@ -66,7 +65,7 @@ func (s *composeService) Remove(ctx context.Context, projectName string, options
 		if err != nil {
 			return err
 		}
-		if !inspected.State.Running || (options.Stop && s.dryRun) {
+		if !inspected.Container.State.Running || (options.Stop && s.dryRun) {
 			stoppedContainers = append(stoppedContainers, ctr)
 		}
 	}
@@ -77,15 +76,14 @@ func (s *composeService) Remove(ctx context.Context, projectName string, options
 	})
 
 	if len(names) == 0 {
-		_, _ = fmt.Fprintln(s.stdinfo(), "No stopped containers")
-		return nil
+		return api.ErrNoResources
 	}
 
 	msg := fmt.Sprintf("Going to remove %s", strings.Join(names, ", "))
 	if options.Force {
 		_, _ = fmt.Fprintln(s.stdout(), msg)
 	} else {
-		confirm, err := prompt.NewPrompt(s.stdin(), s.stdout()).Confirm(msg, false)
+		confirm, err := s.prompt(msg, false)
 		if err != nil {
 			return err
 		}
@@ -93,24 +91,23 @@ func (s *composeService) Remove(ctx context.Context, projectName string, options
 			return nil
 		}
 	}
-	return progress.RunWithTitle(ctx, func(ctx context.Context) error {
+	return Run(ctx, func(ctx context.Context) error {
 		return s.remove(ctx, stoppedContainers, options)
-	}, s.stdinfo(), "Removing")
+	}, "remove", s.events)
 }
 
 func (s *composeService) remove(ctx context.Context, containers Containers, options api.RemoveOptions) error {
-	w := progress.ContextWriter(ctx)
 	eg, ctx := errgroup.WithContext(ctx)
 	for _, ctr := range containers {
 		eg.Go(func() error {
 			eventName := getContainerProgressName(ctr)
-			w.Event(progress.RemovingEvent(eventName))
-			err := s.apiClient().ContainerRemove(ctx, ctr.ID, container.RemoveOptions{
+			s.events.On(removingEvent(eventName))
+			_, err := s.apiClient().ContainerRemove(ctx, ctr.ID, client.ContainerRemoveOptions{
 				RemoveVolumes: options.Volumes,
 				Force:         options.Force,
 			})
 			if err == nil {
-				w.Event(progress.RemovedEvent(eventName))
+				s.events.On(removedEvent(eventName))
 			}
 			return err
 		})

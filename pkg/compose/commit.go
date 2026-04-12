@@ -21,15 +21,15 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/docker/compose/v2/pkg/api"
-	"github.com/docker/compose/v2/pkg/progress"
-	"github.com/docker/docker/api/types/container"
+	"github.com/moby/moby/client"
+
+	"github.com/docker/compose/v5/pkg/api"
 )
 
 func (s *composeService) Commit(ctx context.Context, projectName string, options api.CommitOptions) error {
-	return progress.RunWithTitle(ctx, func(ctx context.Context) error {
+	return Run(ctx, func(ctx context.Context) error {
 		return s.commit(ctx, projectName, options)
-	}, s.stdinfo(), "Committing")
+	}, "commit", s.events)
 }
 
 func (s *composeService) commit(ctx context.Context, projectName string, options api.CommitOptions) error {
@@ -40,47 +40,39 @@ func (s *composeService) commit(ctx context.Context, projectName string, options
 		return err
 	}
 
-	clnt := s.dockerCli.Client()
-
-	w := progress.ContextWriter(ctx)
-
 	name := getCanonicalContainerName(ctr)
-	msg := fmt.Sprintf("Commit %s", name)
 
-	w.Event(progress.Event{
-		ID:         name,
-		Text:       msg,
-		Status:     progress.Working,
-		StatusText: "Committing",
+	s.events.On(api.Resource{
+		ID:     name,
+		Status: api.Working,
+		Text:   api.StatusCommitting,
 	})
 
 	if s.dryRun {
-		w.Event(progress.Event{
-			ID:         name,
-			Text:       msg,
-			Status:     progress.Done,
-			StatusText: "Committed",
+		s.events.On(api.Resource{
+			ID:     name,
+			Status: api.Done,
+			Text:   api.StatusCommitted,
 		})
 
 		return nil
 	}
 
-	response, err := clnt.ContainerCommit(ctx, ctr.ID, container.CommitOptions{
+	response, err := s.apiClient().ContainerCommit(ctx, ctr.ID, client.ContainerCommitOptions{
 		Reference: options.Reference,
 		Comment:   options.Comment,
 		Author:    options.Author,
 		Changes:   options.Changes.GetSlice(),
-		Pause:     options.Pause,
+		NoPause:   !options.Pause,
 	})
 	if err != nil {
 		return err
 	}
 
-	w.Event(progress.Event{
-		ID:         name,
-		Text:       msg,
-		Status:     progress.Done,
-		StatusText: fmt.Sprintf("Committed as %s", response.ID),
+	s.events.On(api.Resource{
+		ID:     name,
+		Text:   fmt.Sprintf("Committed as %s", response.ID),
+		Status: api.Done,
 	})
 
 	return nil

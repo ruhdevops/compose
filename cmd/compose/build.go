@@ -26,10 +26,11 @@ import (
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/docker/cli/cli/command"
 	cliopts "github.com/docker/cli/opts"
-	ui "github.com/docker/compose/v2/pkg/progress"
 	"github.com/spf13/cobra"
 
-	"github.com/docker/compose/v2/pkg/api"
+	"github.com/docker/compose/v5/cmd/display"
+	"github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/compose"
 )
 
 type buildOptions struct {
@@ -66,8 +67,8 @@ func (opts buildOptions) toAPIBuildOptions(services []string) (api.BuildOptions,
 		builderName = os.Getenv("BUILDX_BUILDER")
 	}
 
-	uiMode := ui.Mode
-	if uiMode == ui.ModeJSON {
+	uiMode := display.Mode
+	if uiMode == display.ModeJSON {
 		uiMode = "rawjson"
 	}
 
@@ -90,7 +91,7 @@ func (opts buildOptions) toAPIBuildOptions(services []string) (api.BuildOptions,
 	}, nil
 }
 
-func buildCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service) *cobra.Command {
+func buildCommand(p *ProjectOptions, dockerCli command.Cli, backendOptions *BackendOptions) *cobra.Command {
 	opts := buildOptions{
 		ProjectOptions: p,
 	}
@@ -99,7 +100,7 @@ func buildCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service)
 		Short: "Build or rebuild services",
 		PreRunE: Adapt(func(ctx context.Context, args []string) error {
 			if opts.quiet {
-				ui.Mode = ui.ModeQuiet
+				display.Mode = display.ModeQuiet
 				devnull, err := os.Open(os.DevNull)
 				if err != nil {
 					return err
@@ -115,7 +116,7 @@ func buildCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service)
 			if cmd.Flags().Changed("progress") && opts.ssh == "" {
 				fmt.Fprint(os.Stderr, "--progress is a global compose flag, better use `docker compose --progress xx build ...\n")
 			}
-			return runBuild(ctx, dockerCli, backend, opts, args)
+			return runBuild(ctx, dockerCli, backendOptions, opts, args)
 		}),
 		ValidArgsFunction: completeServiceNames(dockerCli, p),
 	}
@@ -148,9 +149,17 @@ func buildCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service)
 	return cmd
 }
 
-func runBuild(ctx context.Context, dockerCli command.Cli, backend api.Service, opts buildOptions, services []string) error {
+func runBuild(ctx context.Context, dockerCli command.Cli, backendOptions *BackendOptions, opts buildOptions, services []string) error {
+	if opts.print {
+		backendOptions.Add(compose.WithEventProcessor(display.Quiet()))
+	}
+	backend, err := compose.NewComposeService(dockerCli, backendOptions.Options...)
+	if err != nil {
+		return err
+	}
+
 	opts.All = true // do not drop resources as build may involve some dependencies by additional_contexts
-	project, _, err := opts.ToProject(ctx, dockerCli, nil, cli.WithResolvedPaths(true), cli.WithoutEnvironmentResolution)
+	project, _, err := opts.ToProject(ctx, dockerCli, backend, nil, cli.WithoutEnvironmentResolution)
 	if err != nil {
 		return err
 	}

@@ -23,13 +23,14 @@ import (
 
 	"github.com/distribution/reference"
 	"github.com/docker/cli/cli/command"
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/pkg/stringid"
 	"github.com/docker/go-units"
+	"github.com/moby/moby/api/types/image"
+	"github.com/moby/moby/client/pkg/stringid"
 	"github.com/spf13/cobra"
 
-	"github.com/docker/compose/v2/cmd/formatter"
-	"github.com/docker/compose/v2/pkg/bridge"
+	"github.com/docker/compose/v5/cmd/formatter"
+	"github.com/docker/compose/v5/pkg/bridge"
+	"github.com/docker/compose/v5/pkg/compose"
 )
 
 func bridgeCommand(p *ProjectOptions, dockerCli command.Cli) *cobra.Command {
@@ -62,7 +63,12 @@ func convertCommand(p *ProjectOptions, dockerCli command.Cli) *cobra.Command {
 }
 
 func runConvert(ctx context.Context, dockerCli command.Cli, p *ProjectOptions, opts bridge.ConvertOptions) error {
-	project, _, err := p.ToProject(ctx, dockerCli, nil)
+	backend, err := compose.NewComposeService(dockerCli)
+	if err != nil {
+		return err
+	}
+
+	project, _, err := p.ToProject(ctx, dockerCli, backend, nil)
 	if err != nil {
 		return err
 	}

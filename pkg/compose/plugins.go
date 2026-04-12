@@ -33,9 +33,10 @@ import (
 	"github.com/containerd/errdefs"
 	"github.com/docker/cli/cli-plugins/manager"
 	"github.com/docker/cli/cli/config"
-	"github.com/docker/compose/v2/pkg/progress"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+
+	"github.com/docker/compose/v5/pkg/api"
 )
 
 type JsonMessage struct {
@@ -66,7 +67,7 @@ func (s *composeService) runPlugin(ctx context.Context, project *types.Project, 
 		return err
 	}
 
-	variables, err := s.executePlugin(ctx, cmd, command, service)
+	variables, err := s.executePlugin(cmd, command, service)
 	if err != nil {
 		return err
 	}
@@ -85,15 +86,14 @@ func (s *composeService) runPlugin(ctx context.Context, project *types.Project, 
 	return nil
 }
 
-func (s *composeService) executePlugin(ctx context.Context, cmd *exec.Cmd, command string, service types.ServiceConfig) (types.Mapping, error) {
-	pw := progress.ContextWriter(ctx)
+func (s *composeService) executePlugin(cmd *exec.Cmd, command string, service types.ServiceConfig) (types.Mapping, error) {
 	var action string
 	switch command {
 	case "up":
-		pw.Event(progress.CreatingEvent(service.Name))
+		s.events.On(creatingEvent(service.Name))
 		action = "create"
 	case "down":
-		pw.Event(progress.RemovingEvent(service.Name))
+		s.events.On(removingEvent(service.Name))
 		action = "remove"
 	default:
 		return nil, fmt.Errorf("unsupported plugin command: %s", command)
@@ -125,10 +125,10 @@ func (s *composeService) executePlugin(ctx context.Context, cmd *exec.Cmd, comma
 		}
 		switch msg.Type {
 		case ErrorType:
-			pw.Event(progress.NewEvent(service.Name, progress.Error, msg.Message))
+			s.events.On(newEvent(service.Name, api.Error, msg.Message))
 			return nil, errors.New(msg.Message)
 		case InfoType:
-			pw.Event(progress.NewEvent(service.Name, progress.Working, msg.Message))
+			s.events.On(newEvent(service.Name, api.Working, msg.Message))
 		case SetEnvType:
 			key, val, found := strings.Cut(msg.Message, "=")
 			if !found {
@@ -144,14 +144,14 @@ func (s *composeService) executePlugin(ctx context.Context, cmd *exec.Cmd, comma
 
 	err = cmd.Wait()
 	if err != nil {
-		pw.Event(progress.ErrorMessageEvent(service.Name, err.Error()))
+		s.events.On(errorEvent(service.Name, err.Error()))
 		return nil, fmt.Errorf("failed to %s service provider: %s", action, err.Error())
 	}
 	switch command {
 	case "up":
-		pw.Event(progress.CreatedEvent(service.Name))
+		s.events.On(createdEvent(service.Name))
 	case "down":
-		pw.Event(progress.RemovedEvent(service.Name))
+		s.events.On(removedEvent(service.Name))
 	}
 	return variables, nil
 }

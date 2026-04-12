@@ -22,15 +22,17 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/buger/goterm"
 	"github.com/compose-spec/compose-go/v2/types"
-	"github.com/docker/compose/v2/internal/tracing"
-	"github.com/docker/compose/v2/pkg/api"
 	"github.com/eiannone/keyboard"
 	"github.com/skratchdot/open-golang/open"
+
+	"github.com/docker/compose/v5/internal/tracing"
+	"github.com/docker/compose/v5/pkg/api"
 )
 
 const DISPLAY_ERROR_TIME = 10
@@ -90,14 +92,17 @@ const (
 type LogKeyboard struct {
 	kError                KeyboardError
 	Watch                 *KeyboardWatch
+	Detach                func()
 	IsDockerDesktopActive bool
+	IsLogsViewEnabled     bool
 	logLevel              KEYBOARD_LOG_LEVEL
 	signalChannel         chan<- os.Signal
 }
 
-func NewKeyboardManager(isDockerDesktopActive bool, sc chan<- os.Signal) *LogKeyboard {
+func NewKeyboardManager(isDockerDesktopActive, isLogsViewEnabled bool, sc chan<- os.Signal) *LogKeyboard {
 	return &LogKeyboard{
 		IsDockerDesktopActive: isDockerDesktopActive,
+		IsLogsViewEnabled:     isLogsViewEnabled,
 		logLevel:              INFO,
 		signalChannel:         sc,
 	}
@@ -161,29 +166,27 @@ func (lk *LogKeyboard) printNavigationMenu() {
 }
 
 func (lk *LogKeyboard) navigationMenu() string {
-	var openDDInfo string
+	var items []string
 	if lk.IsDockerDesktopActive {
-		openDDInfo = shortcutKeyColor("v") + navColor(" View in Docker Desktop")
+		items = append(items, shortcutKeyColor("v")+navColor(" View in Docker Desktop"))
 	}
 
-	var openDDUI string
-	if openDDInfo != "" {
-		openDDUI = navColor("   ")
-	}
 	if lk.IsDockerDesktopActive {
-		openDDUI = openDDUI + shortcutKeyColor("o") + navColor(" View Config")
+		items = append(items, shortcutKeyColor("o")+navColor(" View Config"))
 	}
 
-	var watchInfo string
-	if openDDInfo != "" || openDDUI != "" {
-		watchInfo = navColor("   ")
+	if lk.IsLogsViewEnabled {
+		items = append(items, shortcutKeyColor("l")+navColor(" View Logs"))
 	}
+
 	isEnabled := " Enable"
 	if lk.Watch != nil && lk.Watch.Watching {
 		isEnabled = " Disable"
 	}
-	watchInfo = watchInfo + shortcutKeyColor("w") + navColor(isEnabled+" Watch")
-	return openDDInfo + openDDUI + watchInfo
+	items = append(items, shortcutKeyColor("w")+navColor(isEnabled+" Watch"))
+	items = append(items, shortcutKeyColor("d")+navColor(" Detach"))
+
+	return strings.Join(items, "   ")
 }
 
 func (lk *LogKeyboard) clearNavigationMenu() {
@@ -192,7 +195,7 @@ func (lk *LogKeyboard) clearNavigationMenu() {
 	saveCursor()
 
 	// clearLine()
-	for i := 0; i < height; i++ {
+	for range height {
 		moveCursorDown(1)
 		clearLine()
 	}
@@ -229,6 +232,24 @@ func (lk *LogKeyboard) openDDComposeUI(ctx context.Context, project *types.Proje
 				if err != nil {
 					err = fmt.Errorf("could not open Docker Desktop Compose UI")
 					lk.keyboardError("View Config", err)
+				}
+				return err
+			})()
+	}()
+}
+
+func (lk *LogKeyboard) openDDLogsView(ctx context.Context) {
+	if !lk.IsLogsViewEnabled {
+		return
+	}
+	go func() {
+		_ = tracing.EventWrapFuncForErrGroup(ctx, "menu/gui/logsview", tracing.SpanOptions{},
+			func(ctx context.Context) error {
+				link := "docker-desktop://dashboard/logs"
+				err := open.Run(link)
+				if err != nil {
+					err = fmt.Errorf("could not open Docker Desktop Logs view: %w", err)
+					lk.keyboardError("View Logs", err)
 				}
 				return err
 			})()
@@ -290,6 +311,9 @@ func (lk *LogKeyboard) ToggleWatch(ctx context.Context, options api.UpOptions) {
 
 func (lk *LogKeyboard) HandleKeyEvents(ctx context.Context, event keyboard.KeyEvent, project *types.Project, options api.UpOptions) {
 	switch kRune := event.Rune; kRune {
+	case 'd':
+		lk.clearNavigationMenu()
+		lk.Detach()
 	case 'v':
 		lk.openDockerDesktop(ctx, project)
 	case 'w':
@@ -311,6 +335,8 @@ func (lk *LogKeyboard) HandleKeyEvents(ctx context.Context, event keyboard.KeyEv
 		lk.ToggleWatch(ctx, options)
 	case 'o':
 		lk.openDDComposeUI(ctx, project)
+	case 'l':
+		lk.openDDLogsView(ctx)
 	}
 	switch key := event.Key; key {
 	case keyboard.KeyCtrlC:
@@ -336,8 +362,12 @@ func (lk *LogKeyboard) EnableWatch(enabled bool, watcher Feature) {
 	}
 }
 
+func (lk *LogKeyboard) EnableDetach(detach func()) {
+	lk.Detach = detach
+}
+
 func allocateSpace(lines int) {
-	for i := 0; i < lines; i++ {
+	for range lines {
 		clearLine()
 		newLine()
 		carriageReturn()

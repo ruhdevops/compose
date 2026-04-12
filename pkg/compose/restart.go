@@ -21,20 +21,20 @@ import (
 	"strings"
 
 	"github.com/compose-spec/compose-go/v2/types"
-	"github.com/docker/compose/v2/pkg/api"
-	"github.com/docker/compose/v2/pkg/progress"
-	"github.com/docker/compose/v2/pkg/utils"
-	"github.com/docker/docker/api/types/container"
+	"github.com/moby/moby/client"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/utils"
 )
 
 func (s *composeService) Restart(ctx context.Context, projectName string, options api.RestartOptions) error {
-	return progress.RunWithTitle(ctx, func(ctx context.Context) error {
+	return Run(ctx, func(ctx context.Context) error {
 		return s.restart(ctx, strings.ToLower(projectName), options)
-	}, s.stdinfo(), "Restarting")
+	}, "restart", s.events)
 }
 
-func (s *composeService) restart(ctx context.Context, projectName string, options api.RestartOptions) error {
+func (s *composeService) restart(ctx context.Context, projectName string, options api.RestartOptions) error { //nolint:gocyclo
 	containers, err := s.getContainers(ctx, projectName, oneOffExclude, true)
 	if err != nil {
 		return err
@@ -75,7 +75,6 @@ func (s *composeService) restart(ctx context.Context, projectName string, option
 		}
 	}
 
-	w := progress.ContextWriter(ctx)
 	return InDependencyOrder(ctx, project, func(c context.Context, service string) error {
 		config := project.Services[service]
 		err = s.waitDependencies(ctx, project, service, config.DependsOn, containers, 0)
@@ -86,14 +85,28 @@ func (s *composeService) restart(ctx context.Context, projectName string, option
 		eg, ctx := errgroup.WithContext(ctx)
 		for _, ctr := range containers.filter(isService(service)) {
 			eg.Go(func() error {
+				def := project.Services[service]
+				for _, hook := range def.PreStop {
+					err = s.runHook(ctx, ctr, def, hook, nil)
+					if err != nil {
+						return err
+					}
+				}
 				eventName := getContainerProgressName(ctr)
-				w.Event(progress.RestartingEvent(eventName))
-				timeout := utils.DurationSecondToInt(options.Timeout)
-				err = s.apiClient().ContainerRestart(ctx, ctr.ID, container.StopOptions{Timeout: timeout})
+				s.events.On(restartingEvent(eventName))
+				_, err = s.apiClient().ContainerRestart(ctx, ctr.ID, client.ContainerRestartOptions{
+					Timeout: utils.DurationSecondToInt(options.Timeout),
+				})
 				if err != nil {
 					return err
 				}
-				w.Event(progress.StartedEvent(eventName))
+				s.events.On(startedEvent(eventName))
+				for _, hook := range def.PostStart {
+					err = s.runHook(ctx, ctr, def, hook, nil)
+					if err != nil {
+						return err
+					}
+				}
 				return nil
 			})
 		}

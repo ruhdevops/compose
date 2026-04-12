@@ -21,13 +21,14 @@ import (
 	"fmt"
 
 	"github.com/compose-spec/compose-go/v2/types"
-	"github.com/docker/compose/v2/cmd/formatter"
-
 	"github.com/docker/cli/cli/command"
-	"github.com/docker/compose/v2/internal/locker"
-	"github.com/docker/compose/v2/pkg/api"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+
+	"github.com/docker/compose/v5/cmd/formatter"
+	"github.com/docker/compose/v5/internal/locker"
+	"github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/compose"
 )
 
 type watchOptions struct {
@@ -36,7 +37,7 @@ type watchOptions struct {
 	noUp  bool
 }
 
-func watchCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service) *cobra.Command {
+func watchCommand(p *ProjectOptions, dockerCli command.Cli, backendOptions *BackendOptions) *cobra.Command {
 	watchOpts := watchOptions{
 		ProjectOptions: p,
 	}
@@ -53,7 +54,7 @@ func watchCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service)
 			if cmd.Parent().Name() == "alpha" {
 				logrus.Warn("watch command is now available as a top level command")
 			}
-			return runWatch(ctx, dockerCli, backend, watchOpts, buildOpts, args)
+			return runWatch(ctx, dockerCli, backendOptions, watchOpts, buildOpts, args)
 		}),
 		ValidArgsFunction: completeServiceNames(dockerCli, p),
 	}
@@ -64,8 +65,13 @@ func watchCommand(p *ProjectOptions, dockerCli command.Cli, backend api.Service)
 	return cmd
 }
 
-func runWatch(ctx context.Context, dockerCli command.Cli, backend api.Service, watchOpts watchOptions, buildOpts buildOptions, services []string) error {
-	project, _, err := watchOpts.ToProject(ctx, dockerCli, services)
+func runWatch(ctx context.Context, dockerCli command.Cli, backendOptions *BackendOptions, watchOpts watchOptions, buildOpts buildOptions, services []string) error {
+	backend, err := compose.NewComposeService(dockerCli, backendOptions.Options...)
+	if err != nil {
+		return err
+	}
+
+	project, _, err := watchOpts.ToProject(ctx, dockerCli, backend, services)
 	if err != nil {
 		return err
 	}
